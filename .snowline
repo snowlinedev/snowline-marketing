@@ -1,0 +1,5 @@
+version: 1
+scope: snowlinedev/snowline-marketing
+name: Snowline Marketing Plugin
+kind: project
+parent: snowlinedev
