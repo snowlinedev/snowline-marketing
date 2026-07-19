@@ -38,8 +38,11 @@ Edge is the first configuration, Snowline itself is the intended second.
 
 ## 3. Boundaries (what it never does)
 
-- Never edits rendered deliverables (store listing, website, screenshots,
-  announcements) — it mints work about them.
+- Never **generates** marketing content — content is canonical in
+  governance; the plugin mints work about it and, where a channel adapter
+  exists, publishes the approved content verbatim (§12). Publishing is
+  never implicit: adapter pushes run only from an explicit operator command
+  or an approval-gated policy consequence.
 - Never marks work complete because generation ran.
 - Never routes across isolated organization scopes.
 - Never executes tenant-supplied code — policy predicates are declarative
@@ -179,7 +182,37 @@ and the plugin does any enrichment. The plugin owns no scheduler.
 - Retry: transient failures with bounded backoff; permanent failures to
   dead-letter with replay.
 
-## 12. Dependencies and sequencing
+## 12. Channel publishing (App Store first)
+
+The plugin can **apply** approved canonical content to external channels
+through per-channel **publisher adapters** — provider-agnostic (the
+external-task-sink provider pattern), App Store Connect first, website and
+others later. Publishing is application of governed content, never
+generation: the render step maps the canonical artifact (store-listing
+fields, keywords, promotional text, what's-new) plus a channel template to
+the channel payload, deterministically.
+
+- **App Store Connect adapter (v1):** pushes listing marketing metadata and
+  screenshot sets (screenshots produced by the asset plugin, referenced by
+  the deliverable ledger) via the ASC API. Tenant API key is secret config;
+  no key, adapter dormant. Marketing metadata ONLY — never binaries,
+  build submission, or release/version state; the app release pipeline
+  owns those.
+- **Dry-run diff:** a publish evaluated in dry-run fetches live channel
+  state and reports an exact field-level diff, pushing nothing. This is the
+  approval surface.
+- **Approval-gated:** publish consequences default `approval-required`; an
+  explicit operator verb executes them. Every push writes an audit row
+  (payload hash, source artifact versions, diff summary, outcome).
+- **Provenance closes automatically on this path:** a successful publish
+  upserts the deliverable-provenance ledger directly (channel, class,
+  source artifact versions with milestone stamps, timestamp) — quarantine
+  (§8) remains for human/agent-produced deliverables only.
+- **Failure posture:** bounded retry for transient ASC errors; partial
+  pushes recorded per field-group; permanent failures dead-letter with
+  replay.
+
+## 13. Dependencies and sequencing
 
 | Dependency | What it unblocks | Build posture |
 |---|---|---|
@@ -188,14 +221,16 @@ and the plugin does any enrichment. The plugin owns no scheduler.
 | Snowline#141 (milestone stamp on ArtifactVersion) | staleness release boundary | sweep works without stamps (version compare only), better with |
 | snowline-pm #65/#66 (musher dispatch opt-in + provider) | autonomous content runs | opt-in flag is inert until they land |
 | snowline-pm `bfd1c5fe` (recurring CRUD tools) | operator-managed recurring policies | recurring policies dormant until schedules manageable |
+| App Store Connect API key (tenant secret) | listing publishing (§12) | adapter dormant until configured |
 
 Build order: (1) service skeleton + registration + health; (2) fixtures
 intake + policy engine + delivery ledger + dry-run (the deterministic
 core); (3) minting through PM + dedup; (4) provenance watch + quarantine +
 staleness sweep; (5) dashboard surfaces; (6) live outbox cutover when #64
-lands.
+lands; (7) App Store Connect publisher adapter (dry-run diff before first
+real push).
 
-## 13. Acceptance criteria
+## 14. Acceptance criteria
 
 Carried from the contract, implementation-refined:
 
@@ -213,3 +248,8 @@ Carried from the contract, implementation-refined:
 - Dead-lettered deliveries replay safely (dedup holds).
 - TurtleTracks and a second tenant (Snowline itself) run on the same code
   with separate policy artifacts.
+- A publish dry-run reports the exact field-level diff against live channel
+  state and pushes nothing; a real publish is approval-gated, audited, and
+  records deliverable provenance atomically or recoverably convergently.
+- Publisher adapters push marketing metadata only — never binaries, build
+  submission, or release state.

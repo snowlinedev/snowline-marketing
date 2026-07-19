@@ -17,7 +17,10 @@ musher-dispatched runs.
   without one lands in an operator-visible quarantine.
 - **Staleness, not regeneration** — the plugin compares source artifact
   versions (with their release-milestone stamps) against recorded
-  deliverable provenance and mints review work; it never edits deliverables.
+  deliverable provenance and mints review work; it never generates content.
+- **Publishing applies, never authors** — per-channel publisher adapters
+  (App Store Connect first) push approved canonical content to external
+  channels: approval-gated, dry-run diffable, marketing metadata only.
 
 ## Status
 
