@@ -1,10 +1,11 @@
 # Snowline Marketing Plugin — Implementation Spec
 
 Status: draft. Implements the generalized marketing plugin product contract
-(governance artifact `b964d217`, revision `bfd5414b`). Design calls settled
-with the owner 2026-07-18 (governance decision on `snowlinedev/snowline`):
-own repo, provenance by watch-and-quarantine, policies as governance
-artifacts.
+(governance artifact `b964d217`, revision `dfda09fa` — adds channel
+publishing). Design calls settled with the owner 2026-07-18 (governance
+decision on `snowlinedev/snowline`): own repo, provenance by
+watch-and-quarantine, policies as governance artifacts. Registered as
+governance artifact `390f3b14` — revise BOTH on change.
 
 ## 1. Purpose
 
