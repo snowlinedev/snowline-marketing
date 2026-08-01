@@ -13,9 +13,15 @@ from __future__ import annotations
 import logging
 
 import pytest
+from conftest import make_envelope
 
 from snowline_marketing.cursors import InMemoryCursorStore
-from snowline_marketing.events import EventEnvelope, MalformedEnvelope, parse_envelope
+from snowline_marketing.events import (
+    EventEnvelope,
+    EventType,
+    MalformedEnvelope,
+    parse_envelope,
+)
 from snowline_marketing.intake import run_intake
 from snowline_marketing.sources import FixturesEventSource, RawEvent, fixture_files
 
@@ -286,15 +292,9 @@ def test_loop_is_source_agnostic():
                     continue
                 yield RawEvent(position=position, body=body, ref=f"outbox/{position}")
 
-    body = {
-        "schema_version": 1,
-        "event_id": "pm-evt-9001",
-        "event_type": "item_completed",
-        "tenant": "turtlesedge",
-        "occurred_at": "2026-07-20T12:00:00+00:00",
-        "subject": {"kind": "work_item", "id": "3f1c9a20"},
-        "payload": {"scope": "turtlesedge/turtletracks"},
-    }
+    # The shared minimal-envelope builder (conftest), not a hand-written
+    # literal — one source of truth for the contract's minimal shape.
+    body = make_envelope(EventType.item_completed, event_id="pm-evt-9001")
     store = InMemoryCursorStore()
     handler = Collector()
     result = run_intake(
@@ -341,3 +341,56 @@ def test_cursor_is_persisted_between_passes(migrated_db, event_fixtures_dir):
         DbCursorStore().read("fixtures:intake-test")
         == (_positions(event_fixtures_dir)[-1])
     )
+
+
+def test_ack_failure_is_returned_not_raised(event_fixtures_dir):
+    """A transient cursor-store error at ack time is infra, not the event's
+    fault: the loop's returns-not-raises contract must hold for it too, and
+    `while_acking` is how a driver tells "back off" from "dead-letter"."""
+
+    class DownCursorStore(InMemoryCursorStore):
+        def ack(self, source_key, position, event_id):
+            raise RuntimeError("cursor store down")
+
+    handler = Collector()
+    result = run_intake(
+        FixturesEventSource(event_fixtures_dir),
+        handler,
+        cursor_store=DownCursorStore(),
+        **_quietly(),
+    )
+    assert not result.ok
+    assert result.failure.while_acking
+    # The event was handled but never acked, so it is in no count — it simply
+    # re-delivers next pass.
+    assert result.delivered == 0
+    assert result.malformed == 0
+    assert result.acked_position is None
+    assert handler.ids  # the handler DID run before the ack failed
+
+
+def test_limit_consumes_exactly_limit_events_from_the_source(event_fixtures_dir):
+    # A bounded pass must not pull the (N+1)th event from the source only to
+    # discard it — at cutover that discarded pull is a wasted outbox fetch on
+    # every pass of a scheduled driver.
+    pulled: list[str] = []
+
+    class CountingSource:
+        source_key = "fixtures:counting"
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def read(self, *, after=None):
+            for raw in self.inner.read(after=after):
+                pulled.append(raw.position)
+                yield raw
+
+    run_intake(
+        CountingSource(FixturesEventSource(event_fixtures_dir)),
+        Collector(),
+        cursor_store=InMemoryCursorStore(),
+        limit=3,
+        **_quietly(),
+    )
+    assert len(pulled) == 3

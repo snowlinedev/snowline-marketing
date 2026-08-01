@@ -57,6 +57,12 @@ class InMemoryCursorStore:
         return self._positions.get(source_key)
 
     def ack(self, source_key: str, position: str, event_id: str | None) -> None:
+        # Same no-rewind guard as the DB store: the two implementations must
+        # not differ in ack semantics, or a loop test passes in memory and
+        # regresses against Postgres.
+        current = self._positions.get(source_key)
+        if current is not None and position <= current:
+            return
         self._positions[source_key] = position
         self._event_ids[source_key] = event_id
 
@@ -68,10 +74,20 @@ class DbCursorStore:
     """The persisted cursor (`consumer_cursors`).
 
     `ack` is a single-statement Postgres upsert rather than a read-then-write:
-    the first ack for a source and every later one take the same code path, and
-    two loop passes overlapping (a supervisor restart racing the old process)
-    cannot lose a row to a lost update — the last writer wins, which for a
-    monotone position is the correct outcome."""
+    the first ack for a source and every later one take the same code path.
+    The conflict update is GUARDED — it applies only when the new position is
+    greater than the stored one. Last-writer-wins would be wrong here: two
+    loop passes can overlap (a supervisor restart racing the old process), and
+    the stale process acking its in-flight event AFTER the new process has
+    moved on would rewind the cursor and re-deliver the whole span between
+    them — with the delivery ledger a later item, nothing dedups that yet. A
+    stale ack is instead a silent no-op, which is what it should be.
+
+    The `<` is SQL text comparison, which matches stream order because the
+    `EventSource` contract requires positions to be LEXICOGRAPHICALLY monotone
+    (see sources.py) — the guard and the source ordering are the same
+    collation-independent ASCII shapes (zero-padded numeric prefixes, monotone
+    event ids) by contract."""
 
     def read(self, source_key: str) -> str | None:
         with session_scope() as session:
@@ -91,12 +107,14 @@ class DbCursorStore:
                     set_={
                         "position": statement.excluded.position,
                         "last_event_id": statement.excluded.last_event_id,
-                        # Set explicitly: the model's `onupdate` fires on ORM
-                        # UPDATEs, and this is an INSERT ... ON CONFLICT, which
-                        # would otherwise leave updated_at at its insert value
-                        # forever — the exact column an operator reads to see
-                        # whether intake is still moving.
+                        # Set explicitly — this upsert is the column's ONLY
+                        # writer (the model deliberately declares no ORM
+                        # `onupdate`), and updated_at is the exact column an
+                        # operator reads to see whether intake is still moving.
                         "updated_at": func.now(),
                     },
+                    # The rewind guard (see class docstring): a stale racing
+                    # ack must not move the cursor backward.
+                    where=ConsumerCursor.position < statement.excluded.position,
                 )
             )

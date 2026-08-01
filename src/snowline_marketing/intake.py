@@ -25,6 +25,12 @@ exists to prevent. Ordering is preserved for the same reason: PM lifecycle
 events are causally ordered (an item completes, then reopens), and evaluating
 them out of order would mint against a state that never existed.
 
+**An ACK failure stops the pass the same way** (`while_acking=True` on the
+recorded failure): a transient cursor-store error is infra, not the event's
+fault — the event was already handled and safely re-delivers next pass, and a
+driver written against `IntakeResult` gets to back off instead of crashing on
+an exception this module's contract says it never raises.
+
 **Malformed envelopes are reported and ACKED PAST.** This is the one place the
 policy needs stating outright, because both failure modes are real. A
 malformed envelope must not be silently lost (spec §4/§8: it belongs in
@@ -47,6 +53,7 @@ driver. It is deliberately NOT wired into the app lifespan: `MARKETING_ENABLED`
 
 from __future__ import annotations
 
+import itertools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -79,6 +86,11 @@ class HandlerFailure:
     # different operator problem (the quarantine path is broken, not the
     # policy path).
     while_reporting_malformed: bool = False
+    # True when the ACK failed after the event was already handled/reported —
+    # infra (the cursor store), not the event. The event re-delivers next
+    # pass, which the at-least-once contract makes safe; a driver seeing this
+    # backs off rather than dead-lettering the event.
+    while_acking: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,52 +151,82 @@ def run_intake(
     acked_position: str | None = None
     failure: HandlerFailure | None = None
 
-    for index, raw in enumerate(source.read(after=after)):
-        if limit is not None and index >= limit:
-            break
-
-        parsed = parse_envelope(raw.body, ref=raw.ref, position=raw.position)
-
-        if isinstance(parsed, MalformedEnvelope):
-            try:
-                report(parsed)
-            except Exception as exc:  # the quarantine handoff itself failed
-                log.exception(
-                    "malformed-event report failed at %s — pass stopped, "
-                    "position left un-acked",
-                    raw.position,
-                )
-                failure = HandlerFailure(
-                    position=raw.position,
-                    event_id=parsed.event_id,
-                    error=repr(exc),
-                    while_reporting_malformed=True,
-                )
-                break
-            malformed += 1
-            # Advance past it: reported, not handled. See the module docstring
-            # on why a malformed envelope must not wedge the stream.
-            cursor_store.ack(source_key, raw.position, parsed.event_id)
-            acked_position = raw.position
-            continue
-
+    def attempt(
+        action: Callable[[], None],
+        describe: str,
+        *,
+        position: str,
+        event_id: str | None,
+        while_reporting_malformed: bool = False,
+        while_acking: bool = False,
+    ) -> HandlerFailure | None:
+        """One guarded step. EVERY step of an event's lifecycle — report,
+        handle, ack — goes through here, so all three fail the same way: log,
+        record, stop the pass with the position un-acked. The returns-not-
+        raises contract holds even when the failing step is the cursor store
+        itself (a transient DB error at ack time is infra, not a reason to
+        crash a driver written against IntakeResult)."""
         try:
-            handler(parsed)
+            action()
+            return None
         except Exception as exc:
             log.exception(
-                "intake handler failed on event %s at %s — pass stopped, "
-                "position left un-acked (re-delivers next pass)",
-                parsed.event_id,
-                raw.position,
+                "%s failed at %s — pass stopped, position left un-acked "
+                "(re-delivers next pass)",
+                describe,
+                position,
             )
-            failure = HandlerFailure(
+            return HandlerFailure(
+                position=position,
+                event_id=event_id,
+                error=repr(exc),
+                while_reporting_malformed=while_reporting_malformed,
+                while_acking=while_acking,
+            )
+
+    # islice, not enumerate+break: a bounded pass must consume EXACTLY `limit`
+    # events from the source — pulling one extra means a wasted file read (or,
+    # at cutover, a wasted outbox fetch) discarded and re-fetched every pass.
+    for raw in itertools.islice(source.read(after=after), limit):
+        parsed = parse_envelope(raw.body, ref=raw.ref, position=raw.position)
+        is_malformed = isinstance(parsed, MalformedEnvelope)
+
+        if is_malformed:
+            # Advance-past policy: reported, not handled. See the module
+            # docstring on why a malformed envelope must not wedge the stream.
+            failure = attempt(
+                lambda: report(parsed),
+                "malformed-event report",
                 position=raw.position,
                 event_id=parsed.event_id,
-                error=repr(exc),
+                while_reporting_malformed=True,
             )
+        else:
+            failure = attempt(
+                lambda: handler(parsed),
+                f"intake handler (event {parsed.event_id})",
+                position=raw.position,
+                event_id=parsed.event_id,
+            )
+        if failure is not None:
             break
-        delivered += 1
-        cursor_store.ack(source_key, raw.position, parsed.event_id)
+
+        failure = attempt(
+            lambda: cursor_store.ack(source_key, raw.position, parsed.event_id),
+            "cursor ack",
+            position=raw.position,
+            event_id=parsed.event_id,
+            while_acking=True,
+        )
+        if failure is not None:
+            break
+
+        # Counted only once acked — the counts are "events this pass is DONE
+        # with", and an event whose ack failed re-delivers next pass.
+        if is_malformed:
+            malformed += 1
+        else:
+            delivered += 1
         acked_position = raw.position
 
     return IntakeResult(

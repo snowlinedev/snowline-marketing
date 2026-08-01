@@ -57,11 +57,15 @@ class ConsumerCursor(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # No ORM `onupdate`: the column's ONLY writer is DbCursorStore's
+    # INSERT ... ON CONFLICT upsert, which bypasses ORM update hooks and sets
+    # this explicitly. Declaring an onupdate here would document a code path
+    # that does not exist; any future non-upsert writer must set the column
+    # itself.
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
-        onupdate=func.now(),
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid

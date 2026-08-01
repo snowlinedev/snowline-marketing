@@ -15,7 +15,7 @@ from snowline_marketing.cursors import DbCursorStore, InMemoryCursorStore
 from snowline_marketing.db import session_scope
 from snowline_marketing.models import ConsumerCursor
 
-SOURCE = "fixtures:events"
+SOURCE = "test-cursors:events"
 
 
 def test_in_memory_store_round_trips():
@@ -100,3 +100,27 @@ def test_sources_do_not_share_a_cursor(migrated_db):
     DbCursorStore().ack("fixtures:b", "0090-z.json", "pm-evt-9")
     assert DbCursorStore().read("fixtures:a") == "0010-a.json"
     assert DbCursorStore().read("fixtures:b") == "0090-z.json"
+
+
+def test_stale_ack_does_not_rewind_the_cursor(migrated_db):
+    # Two passes can overlap (a supervisor restart racing the old process):
+    # the stale process acking its in-flight event AFTER the new process has
+    # moved on must be a no-op, or the span between the two positions
+    # re-delivers with nothing to dedup it yet.
+    store = DbCursorStore()
+    store.ack(SOURCE, "0100-b.json", "pm-evt-100")
+    store.ack(SOURCE, "0050-a.json", "pm-evt-50")
+    assert store.read(SOURCE) == "0100-b.json"
+    with session_scope() as session:
+        row = session.get(ConsumerCursor, SOURCE)
+        assert row.last_event_id == "pm-evt-100"
+
+
+def test_in_memory_stale_ack_does_not_rewind():
+    # Same guard as the DB store — the two implementations must not differ in
+    # ack semantics, or a loop test passes in memory and regresses on Postgres.
+    store = InMemoryCursorStore()
+    store.ack(SOURCE, "0100-b.json", "pm-evt-100")
+    store.ack(SOURCE, "0050-a.json", "pm-evt-50")
+    assert store.read(SOURCE) == "0100-b.json"
+    assert store.last_event_id(SOURCE) == "pm-evt-100"

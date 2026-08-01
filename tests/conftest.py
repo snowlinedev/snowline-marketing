@@ -44,6 +44,99 @@ from alembic import command  # noqa: E402
 # one place); safe to import before the fixtures run — the DB layer is lazy.
 from snowline_marketing.db import alembic_config, reset_engine  # noqa: E402
 
+# The tenant/scope slugs every test and fixture speaks — the REAL Turtle's
+# Edge slugs, so a captured fixture and a hand-built envelope can't drift
+# apart on identity.
+TENANT = "turtlesedge"
+SCOPE = "turtlesedge/turtletracks"
+
+
+# The per-type shape each event REQUIRES (spec §5 subject refs + §6 predicate
+# surface). Keyed by every EventType member — test_events asserts the
+# coverage, so a new event type cannot be added without landing here. Lives in
+# conftest because BOTH test_events (contract tests) and test_intake (a
+# source-agnostic loop test) build envelopes from it — one source of truth for
+# the minimal-valid shape.
+def _type_specific() -> dict:
+    from snowline_marketing.events import EventType
+
+    return {
+        EventType.item_completed: {},
+        EventType.item_reopened: {},
+        EventType.item_abandoned: {},
+        EventType.item_rescoped: {
+            "payload": {"scope": SCOPE, "details": {"from_scope": "turtlesedge/legacy"}}
+        },
+        EventType.initiative_phase_completed: {
+            "subject": {"kind": "initiative", "id": "8ad41b77", "phase": "build"},
+            "payload": {
+                "scope": SCOPE,
+                "initiative": "summer-release",
+                "phase": "build",
+            },
+        },
+        EventType.milestone_state_changed: {
+            "subject": {"kind": "milestone", "id": "ms-4c72a1"},
+            "payload": {
+                "scope": SCOPE,
+                "milestone": "v1.4",
+                "details": {"from_state": "planned", "to_state": "active"},
+            },
+        },
+        EventType.milestone_released: {
+            "subject": {"kind": "milestone", "id": "ms-4c72a1"},
+            "payload": {"scope": SCOPE, "milestone": "v1.4"},
+        },
+        EventType.recurring_item_fired: {
+            "subject": {"kind": "schedule", "id": "sched-monthly-metrics"},
+        },
+        EventType.semantic_signal: {
+            "payload": {"scope": SCOPE, "signals": ["marketing-impact"]},
+        },
+    }
+
+
+TYPE_SPECIFIC = _type_specific()
+
+
+def make_envelope(event_type, **overrides) -> dict:
+    """A minimal VALID envelope dict for `event_type` — only what that type
+    requires, so a test that mutates one field is testing that field."""
+    from snowline_marketing.events import SCHEMA_VERSION
+
+    base: dict = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": f"pm-evt-{event_type.value}",
+        "event_type": event_type.value,
+        "tenant": TENANT,
+        "occurred_at": "2026-07-20T12:00:00+00:00",
+        "subject": {"kind": "work_item", "id": "3f1c9a20"},
+        "payload": {"scope": SCOPE},
+    }
+    base.update(TYPE_SPECIFIC[event_type])
+    for key, value in overrides.items():
+        base[key] = value
+    return base
+
+
+@pytest.fixture(autouse=True)
+def _cursor_rows_do_not_leak(request):
+    """Any DB-backed test leaves `consumer_cursors` EMPTY behind it. Cursor
+    rows key on source_key alone, and `FixturesEventSource`'s default key is
+    derived from the directory NAME — so a row leaked by one test silently
+    becomes another test's resume point, an execution-order-dependent flake in
+    exactly the isolation area this suite exists to nail down."""
+    yield
+    if "migrated_db" not in request.fixturenames:
+        return
+    import sqlalchemy as sa_
+
+    from snowline_marketing.db import session_scope
+    from snowline_marketing.models import ConsumerCursor
+
+    with session_scope() as session:
+        session.execute(sa_.delete(ConsumerCursor))
+
 
 @pytest.fixture(autouse=True)
 def _marketing_stays_disabled(monkeypatch):

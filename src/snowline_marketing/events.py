@@ -185,6 +185,17 @@ class EventPayload(_Model):
         # round-trip through JSON is useless to a capture or a quarantine row.
         return dict(value)
 
+    def __hash__(self) -> int:
+        # `frozen=True` would otherwise generate a by-fields hash that RAISES
+        # at runtime (`details` is a mappingproxy over arbitrary JSON — not
+        # hashable), advertising a contract it cannot deliver. The payload has
+        # no identity of its own; hash the ENVELOPE, whose identity is
+        # (tenant, event_id).
+        raise TypeError(
+            "EventPayload is not hashable (details is a free-form mapping); "
+            "hash the EventEnvelope, whose identity is (tenant, event_id)"
+        )
+
 
 # Which subject kinds each event type may legally have. A completion event
 # whose subject is a milestone is a producer bug, and mapping it into a policy
@@ -237,6 +248,16 @@ class EventEnvelope(_Model):
     occurred_at: datetime
     subject: EntityRef
     payload: EventPayload
+
+    def __hash__(self) -> int:
+        # The generated frozen-model hash would recurse into `payload`, which
+        # is unhashable by construction (free-form `details`). Hash on the
+        # event's IDENTITY instead: `tenant + event_id` is the spec's dedup
+        # key (§4 — the ledger scopes it per policy), so two envelopes that
+        # compare equal necessarily share it, keeping the eq/hash contract.
+        # This is what lets a driver or ledger hold `set[EventEnvelope]`
+        # across re-deliveries.
+        return hash((self.tenant, self.event_id))
 
     @field_validator("occurred_at", mode="after")
     @classmethod

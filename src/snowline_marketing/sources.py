@@ -69,7 +69,14 @@ class EventSource(Protocol):
     order, oldest first, and must be replayable: an un-acked event is yielded
     again on the next call. That is the at-least-once contract (spec §5); the
     delivery ledger (§4) makes the resulting re-delivery idempotent, which is
-    explicitly not this layer's problem."""
+    explicitly not this layer's problem.
+
+    Positions must be LEXICOGRAPHICALLY monotone in stream order — not just
+    unique. Both the `after` filter and the cursor store's rewind guard
+    compare positions as text, so a source whose positions don't sort the way
+    they stream would silently skip or re-deliver. Fixtures achieve this with
+    fixed-width zero-padded prefixes (validated in `fixture_files`); the live
+    outbox source must pick monotone tokens the same way."""
 
     source_key: str
 
@@ -82,9 +89,18 @@ def fixture_files(directory: Path | str) -> list[Path]:
     Sorted by NAME, not by whatever order the filesystem enumerates (which is
     neither stable across machines nor meaningful anywhere). Dot-prefixed
     files are skipped — macOS AppleDouble siblings (`._foo.json`) are not
-    events."""
+    events.
+
+    The numeric prefixes are VALIDATED, not trusted: lexicographic name order
+    equals stream order only while every prefix has the same width ('10000-'
+    sorts before '2000-'), and the cursor's `after` comparison plus the DB
+    store's rewind guard both ride that same lexicographic contract. A
+    capture violating it must fail LOUDLY here — the alternative is an event
+    silently skipped on every pass forever, with no malformed report and no
+    log line, which is exactly the failure mode quarantine exists to
+    prevent."""
     path = Path(directory)
-    return sorted(
+    files = sorted(
         (
             p
             for p in path.glob(f"*{FIXTURE_SUFFIX}")
@@ -92,6 +108,23 @@ def fixture_files(directory: Path | str) -> list[Path]:
         ),
         key=lambda p: p.name,
     )
+    widths: dict[int, str] = {}
+    for p in files:
+        prefix = p.name.split("-", 1)[0]
+        if not prefix.isdigit():
+            raise ValueError(
+                f"fixture {p.name!r} has no numeric 'NNNN-' prefix — stream "
+                "order comes from the prefix, so every fixture must carry one"
+            )
+        widths.setdefault(len(prefix), p.name)
+    if len(widths) > 1:
+        examples = ", ".join(sorted(widths.values()))
+        raise ValueError(
+            f"fixture prefixes in {path} mix widths ({examples}): lexicographic "
+            "order would diverge from numeric order and resumption would "
+            "silently skip events — zero-pad every prefix to one width"
+        )
+    return files
 
 
 def iter_fixture_envelopes(directory: Path | str) -> Iterator[ParsedEnvelope]:
@@ -101,9 +134,13 @@ def iter_fixture_envelopes(directory: Path | str) -> Iterator[ParsedEnvelope]:
     or a `MalformedEnvelope` per file, never raising on a bad one. This is the
     read surface for anything that wants the events without running the intake
     loop — the §11 dry-run ("evaluate a policy version against captured
-    fixtures, mint nothing") is the intended second caller."""
-    for path in fixture_files(directory):
-        yield parse_envelope(path.read_bytes(), ref=str(path), position=path.name)
+    fixtures, mint nothing") is the intended second caller.
+
+    Implemented OVER `FixturesEventSource.read`, not beside it: one read path,
+    so the dry-run can never see a different event stream than the intake
+    loop."""
+    for raw in FixturesEventSource(directory).read():
+        yield parse_envelope(raw.body, ref=raw.ref, position=raw.position)
 
 
 class FixturesEventSource:

@@ -14,8 +14,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+# The minimal-envelope builder and per-type shapes live in conftest.py — one
+# source of truth shared with test_intake, so the envelope contract cannot be
+# tested against one shape here and another there.
+from conftest import SCOPE, TENANT, TYPE_SPECIFIC, make_envelope
+
 from snowline_marketing.events import (
-    SCHEMA_VERSION,
     EntityKind,
     EventEnvelope,
     EventType,
@@ -24,67 +28,10 @@ from snowline_marketing.events import (
     parse_envelope,
 )
 
-TENANT = "turtlesedge"
-SCOPE = "turtlesedge/turtletracks"
-
-
-def _envelope(event_type: EventType, **overrides) -> dict:
-    """A minimal VALID envelope for `event_type` — only what that type
-    requires, so a test that mutates one field is testing that field."""
-    base: dict = {
-        "schema_version": SCHEMA_VERSION,
-        "event_id": f"pm-evt-{event_type.value}",
-        "event_type": event_type.value,
-        "tenant": TENANT,
-        "occurred_at": "2026-07-20T12:00:00+00:00",
-        "subject": {"kind": "work_item", "id": "3f1c9a20"},
-        "payload": {"scope": SCOPE},
-    }
-    base.update(_TYPE_SPECIFIC[event_type])
-    for key, value in overrides.items():
-        base[key] = value
-    return base
-
-
-# The per-type shape each event REQUIRES (spec §5 subject refs + §6 predicate
-# surface). Keyed by every EventType member — `test_every_v1_event_type_...`
-# asserts the coverage, so a new event type cannot be added without landing
-# here.
-_TYPE_SPECIFIC: dict[EventType, dict] = {
-    EventType.item_completed: {},
-    EventType.item_reopened: {},
-    EventType.item_abandoned: {},
-    EventType.item_rescoped: {
-        "payload": {"scope": SCOPE, "details": {"from_scope": "turtlesedge/legacy"}}
-    },
-    EventType.initiative_phase_completed: {
-        "subject": {"kind": "initiative", "id": "8ad41b77", "phase": "build"},
-        "payload": {"scope": SCOPE, "initiative": "summer-release", "phase": "build"},
-    },
-    EventType.milestone_state_changed: {
-        "subject": {"kind": "milestone", "id": "ms-4c72a1"},
-        "payload": {
-            "scope": SCOPE,
-            "milestone": "v1.4",
-            "details": {"from_state": "planned", "to_state": "active"},
-        },
-    },
-    EventType.milestone_released: {
-        "subject": {"kind": "milestone", "id": "ms-4c72a1"},
-        "payload": {"scope": SCOPE, "milestone": "v1.4"},
-    },
-    EventType.recurring_item_fired: {
-        "subject": {"kind": "schedule", "id": "sched-monthly-metrics"},
-    },
-    EventType.semantic_signal: {
-        "payload": {"scope": SCOPE, "signals": ["marketing-impact"]},
-    },
-}
-
 
 @pytest.mark.parametrize("event_type", list(EventType))
 def test_every_v1_event_type_parses(event_type):
-    parsed = parse_envelope(_envelope(event_type))
+    parsed = parse_envelope(make_envelope(event_type))
     assert isinstance(parsed, EventEnvelope), parsed
     assert parsed.event_type is event_type
 
@@ -94,7 +41,7 @@ def test_every_v1_event_type_round_trips_through_json(event_type):
     # Envelopes are captured to disk and replayed (spec §5 fixtures mode) and
     # a quarantine row keeps the raw body — an envelope that cannot survive
     # dict -> model -> JSON -> model is not a wire contract.
-    original = parse_envelope(_envelope(event_type))
+    original = parse_envelope(make_envelope(event_type))
     assert isinstance(original, EventEnvelope)
     again = parse_envelope(original.model_dump_json())
     assert again == original
@@ -103,12 +50,12 @@ def test_every_v1_event_type_round_trips_through_json(event_type):
 def test_every_v1_event_type_has_a_sample():
     # Guards the parametrized tests above: adding an EventType without a shape
     # here would otherwise quietly test nothing for it.
-    assert set(_TYPE_SPECIFIC) == set(EventType)
+    assert set(TYPE_SPECIFIC) == set(EventType)
 
 
 def test_envelope_fields_are_populated():
     parsed = parse_envelope(
-        _envelope(
+        make_envelope(
             EventType.item_completed,
             payload={
                 "scope": SCOPE,
@@ -147,7 +94,7 @@ def test_envelope_fields_are_populated():
 def test_envelope_is_immutable():
     # An envelope records something that already happened; a policy must not be
     # able to hand the next policy a mutated event.
-    parsed = parse_envelope(_envelope(EventType.item_completed))
+    parsed = parse_envelope(make_envelope(EventType.item_completed))
     assert isinstance(parsed, EventEnvelope)
     with pytest.raises(Exception):
         parsed.event_id = "rewritten"
@@ -159,7 +106,7 @@ def test_non_utc_offset_is_preserved_not_normalized_away():
     # tz-aware is the requirement, UTC is not: a producer in another offset is
     # legitimate, and the instant is what ordering compares.
     parsed = parse_envelope(
-        _envelope(EventType.item_completed, occurred_at="2026-07-20T14:00:00+02:00")
+        make_envelope(EventType.item_completed, occurred_at="2026-07-20T14:00:00+02:00")
     )
     assert isinstance(parsed, EventEnvelope)
     assert parsed.occurred_at.utcoffset() == timedelta(hours=2)
@@ -189,7 +136,7 @@ MALFORMED_CASES = [
     "label,mutation,field", MALFORMED_CASES, ids=[c[0] for c in MALFORMED_CASES]
 )
 def test_malformed_envelopes_classify_with_a_reason(label, mutation, field):
-    body = _envelope(EventType.item_completed)
+    body = make_envelope(EventType.item_completed)
     for key, value in mutation.items():
         if value is None:
             body.pop(key, None)
@@ -261,7 +208,7 @@ SHAPE_CASES = [
 def test_type_specific_shape_violations_are_malformed(
     label, event_type, mutation, detail
 ):
-    parsed = parse_envelope(_envelope(event_type, **mutation))
+    parsed = parse_envelope(make_envelope(event_type, **mutation))
     assert isinstance(parsed, MalformedEnvelope), f"{label} should be malformed"
     assert detail in parsed.detail, parsed.detail
 
@@ -269,14 +216,14 @@ def test_type_specific_shape_violations_are_malformed(
 def test_malformed_keeps_a_best_effort_event_id():
     # A quarantine row wants the id even when the envelope failed for some
     # unrelated reason — that is what an operator searches by.
-    body = _envelope(EventType.item_completed, occurred_at="nonsense")
+    body = make_envelope(EventType.item_completed, occurred_at="nonsense")
     parsed = parse_envelope(body)
     assert isinstance(parsed, MalformedEnvelope)
     assert parsed.event_id == "pm-evt-item_completed"
 
 
 def test_malformed_event_id_is_none_when_unusable():
-    body = _envelope(EventType.item_completed)
+    body = make_envelope(EventType.item_completed)
     body["event_id"] = 17
     parsed = parse_envelope(body)
     assert isinstance(parsed, MalformedEnvelope)
@@ -301,7 +248,7 @@ def test_json_that_is_not_an_object_is_malformed(body):
 def test_parse_accepts_bytes_and_decoded_mappings_alike():
     # The fixtures source hands over undecoded file bytes; the live outbox will
     # hand over decoded rows. Both must reach the same envelope.
-    body = _envelope(EventType.item_completed)
+    body = make_envelope(EventType.item_completed)
     from_mapping = parse_envelope(body)
     from_bytes = parse_envelope(json.dumps(body).encode("utf-8"))
     assert isinstance(from_mapping, EventEnvelope)
@@ -313,3 +260,25 @@ def test_locators_ride_through_to_the_malformed_record():
     assert isinstance(parsed, MalformedEnvelope)
     assert parsed.ref == "/captures/0010.json"
     assert parsed.position == "0010.json"
+
+
+def test_envelopes_hash_on_identity():
+    # The frozen envelope must actually BE usable as a value: a driver or the
+    # future delivery ledger deduping re-deliveries with set[EventEnvelope]
+    # relies on hash agreeing with eq (identity = tenant + event_id, spec §4).
+    a = parse_envelope(make_envelope(EventType.item_completed))
+    b = parse_envelope(make_envelope(EventType.item_completed))
+    assert isinstance(a, EventEnvelope) and isinstance(b, EventEnvelope)
+    assert a == b
+    assert hash(a) == hash(b)
+    assert len({a, b}) == 1
+
+
+def test_payload_is_explicitly_not_hashable():
+    # The payload has no identity of its own (free-form details); the frozen
+    # config would otherwise ADVERTISE hashability and raise an inscrutable
+    # mappingproxy TypeError from inside pydantic instead of this message.
+    parsed = parse_envelope(make_envelope(EventType.item_completed))
+    assert isinstance(parsed, EventEnvelope)
+    with pytest.raises(TypeError, match="hash the EventEnvelope"):
+        hash(parsed.payload)

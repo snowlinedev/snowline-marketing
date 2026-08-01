@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from snowline_marketing.events import (
     EventEnvelope,
     EventType,
@@ -153,3 +155,19 @@ def test_empty_directory_is_an_empty_stream(tmp_path):
     source = FixturesEventSource(tmp_path)
     assert list(source.read()) == []
     assert list(iter_fixture_envelopes(tmp_path)) == []
+
+
+def test_mixed_prefix_widths_fail_loudly(tmp_path):
+    # '10000-' sorts lexicographically before '2000-', so a mixed-width capture
+    # would deliver out of order and silently skip events on resume — that must
+    # be a loud listing-time error, never a quiet loss.
+    (tmp_path / "2000-a.json").write_text("{}")
+    (tmp_path / "10000-b.json").write_text("{}")
+    with pytest.raises(ValueError, match="mix widths"):
+        fixture_files(tmp_path)
+
+
+def test_prefixless_fixture_fails_loudly(tmp_path):
+    (tmp_path / "no-prefix.json").write_text("{}")
+    with pytest.raises(ValueError, match="numeric"):
+        fixture_files(tmp_path)
