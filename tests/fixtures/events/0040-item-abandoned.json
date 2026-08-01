@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000104",
+  "event_type": "item_abandoned",
+  "tenant": "turtles-edge",
+  "occurred_at": "2026-07-15T11:48:02+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "b62d4417"
+  },
+  "payload": {
+    "scope": "turtles-edge/turtletracks",
+    "initiative": "summer-release",
+    "phase": "design",
+    "work_kind": "spike",
+    "relations": [],
+    "signals": [],
+    "external_refs": [],
+    "details": {
+      "title": "Live route sharing prototype",
+      "reason": "superseded by the offline sync design"
+    }
+  }
+}

@@ -6,6 +6,11 @@ SNOWLINE_SHADOW_TURNS_ENABLED). There is no intake/policy loop yet to
 accidentally start, but the gate is pinned now so future engine tests
 inherit a safe default without each one having to remember to set it.
 
+`event_fixtures_dir` points at the captured event envelopes in
+`tests/fixtures/events/` — the shipped v1 stream (every event type, plus
+malformed cases), shared by the source, intake-loop and envelope tests so they
+all assert against the SAME capture rather than each inventing its own.
+
 `migrated_db` mirrors the house plugin idiom: a disposable Postgres database,
 migrated with `alembic upgrade head` (exercising the migration chain), that
 `pytest.skip`s with a clear message when Postgres is unreachable (or
@@ -17,8 +22,12 @@ environment with no Postgres (e.g. plain CI with no service container).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
+
+# The shipped capture (spec §5: fixtures mode is a first-class dev/CI surface).
+EVENT_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "events"
 
 # Point marketing's DB layer at the disposable test database BEFORE any
 # marketing module builds its (lazy) engine.
@@ -44,6 +53,12 @@ def _marketing_stays_disabled(monkeypatch):
     evaluation mid-test. Symmetric to the platform's
     SNOWLINE_SHADOW_TURNS_ENABLED pin."""
     monkeypatch.setenv("MARKETING_ENABLED", "0")
+
+
+@pytest.fixture
+def event_fixtures_dir() -> Path:
+    """The shipped event capture directory (see module docstring)."""
+    return EVENT_FIXTURES_DIR
 
 
 def _db_name(url: str) -> str:

@@ -11,15 +11,16 @@ A FastAPI app that:
 
 Marketing has its OWN database; like the house plugin convention it boot-
 migrates to the latest Alembic head in the lifespan, so a schema change
-deploys on a plain restart. There is no schema yet (no delivery ledger, no
-deliverable provenance ledger — later items, spec §4); the migration chain
-is baselined empty so it exists.
+deploys on a plain restart. The schema so far is the intake consumer cursor
+(spec §4); the delivery ledger, deliverable provenance ledger and quarantine
+land with their own items.
 
-This is scaffold-only: no fixtures intake loop, no policy engine, no ledger
-tables, no audit surfaces yet. Those are separate follow-up items (spec §13
-stages 2+). `MARKETING_ENABLED` (off by default, spec §2) gates the future
-intake/evaluation loops; nothing in this phase does anything gated by it yet
-beyond existing as a config knob surfaced on /health.
+Nothing runs in the background here but the registration heartbeat. The event
+intake loop EXISTS (`intake.run_intake`, driven by tests against captured
+fixtures) but is deliberately not wired into this lifespan: it starts when the
+live PM outbox source lands, and `MARKETING_ENABLED` (off by default, spec §2)
+is what will gate it then. No policy engine, no minting, no audit surfaces yet
+— separate follow-up items (spec §13 stages 2+).
 """
 
 from __future__ import annotations

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000111",
+  "event_type": "recurring_item_fired",
+  "tenant": "turtles-edge",
+  "occurred_at": "2026-08-01T07:00:00+00:00",
+  "subject": {
+    "kind": "schedule",
+    "id": "sched-monthly-metrics"
+  },
+  "payload": {
+    "scope": "turtles-edge/turtletracks",
+    "work_kind": "review",
+    "relations": [],
+    "signals": [],
+    "external_refs": [],
+    "details": {
+      "title": "Monthly metrics snapshot",
+      "cadence": "monthly",
+      "minted_work_item": "e41b0d92"
+    }
+  }
+}

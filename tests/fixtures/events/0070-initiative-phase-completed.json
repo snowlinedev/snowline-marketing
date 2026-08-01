@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000107",
+  "event_type": "initiative_phase_completed",
+  "tenant": "turtles-edge",
+  "occurred_at": "2026-07-17T14:05:19+00:00",
+  "subject": {
+    "kind": "initiative",
+    "id": "8ad41b77",
+    "phase": "build"
+  },
+  "payload": {
+    "scope": "turtles-edge/turtletracks",
+    "initiative": "summer-release",
+    "phase": "build",
+    "milestone": "v1.4",
+    "relations": [],
+    "signals": [],
+    "external_refs": [],
+    "details": {
+      "title": "Summer release",
+      "next_phase": "launch"
+    }
+  }
+}

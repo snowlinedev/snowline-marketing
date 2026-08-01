@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000103",
+  "event_type": "item_reopened",
+  "tenant": "turtles-edge",
+  "occurred_at": "2026-07-15T09:12:44+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "3f1c9a20"
+  },
+  "payload": {
+    "scope": "turtles-edge/turtletracks",
+    "initiative": "summer-release",
+    "phase": "build",
+    "milestone": "v1.4",
+    "work_kind": "implementation",
+    "relations": [
+      {"kind": "marketing-impact", "target": "8ad41b77"}
+    ],
+    "signals": ["marketing-impact"],
+    "external_refs": [],
+    "details": {
+      "title": "Offline trip log sync",
+      "reason": "sync conflict resolution regressed on slow links"
+    }
+  }
+}

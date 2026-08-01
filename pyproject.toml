@@ -14,6 +14,9 @@ dependencies = [
     # Imported directly (lifespan task group, heartbeat loop) — declared,
     # not ridden transitively via starlette/httpx.
     "anyio>=4",
+    # Imported directly (the event envelope schema) — declared, not ridden
+    # transitively via fastapi. No new package: fastapi already pins it.
+    "pydantic>=2.7",
 ]
 
 [dependency-groups]

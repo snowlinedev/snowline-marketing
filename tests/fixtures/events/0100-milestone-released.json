@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000110",
+  "event_type": "milestone_released",
+  "tenant": "turtles-edge",
+  "occurred_at": "2026-07-19T18:44:56+00:00",
+  "subject": {
+    "kind": "milestone",
+    "id": "ms-4c72a1"
+  },
+  "payload": {
+    "scope": "turtles-edge/turtletracks",
+    "initiative": "summer-release",
+    "milestone": "v1.4",
+    "relations": [],
+    "signals": [],
+    "external_refs": [
+      {
+        "kind": "release",
+        "url": "https://github.com/turtles-edge/turtletracks/releases/tag/v1.4.0"
+      }
+    ],
+    "details": {
+      "from_state": "active",
+      "to_state": "released",
+      "version": "1.4.0"
+    }
+  }
+}

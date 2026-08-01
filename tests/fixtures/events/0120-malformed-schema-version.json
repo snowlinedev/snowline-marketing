@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "event_id": "pm-evt-0000112",
+  "event_type": "item_completed",
+  "tenant": "turtles-edge",
+  "occurred_at": "2026-08-01T08:15:00+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "5cc02f8b"
+  },
+  "payload": {
+    "scope": "turtles-edge/turtletracks",
+    "details": {
+      "note": "a producer speaking a version this consumer does not know"
+    }
+  }
+}

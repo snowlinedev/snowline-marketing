@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000109",
+  "event_type": "milestone_released",
+  "tenant": "turtles-edge",
+  "occurred_at": "2026-07-18T10:30:00",
+  "subject": {
+    "kind": "milestone",
+    "id": "ms-4c72a1"
+  },
+  "payload": {
+    "scope": "turtles-edge/turtletracks",
+    "milestone": "v1.4",
+    "details": {
+      "note": "no offset — which 10:30 is unanswerable, so it is not usable"
+    }
+  }
+}
