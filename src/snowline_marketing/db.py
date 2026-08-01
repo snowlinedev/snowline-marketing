@@ -36,7 +36,12 @@ def alembic_config(url: str | None = None) -> AlembicConfig:
     `url` defaults to the live `database_url()`."""
     cfg = AlembicConfig()
     cfg.set_main_option("script_location", str(MIGRATIONS))
-    cfg.set_main_option("sqlalchemy.url", url or database_url())
+    # Alembic's Config rides configparser, whose interpolation treats a bare
+    # `%` as syntax — a percent-encoded credential (e.g. an `@` in a password
+    # as `%40`) would raise ValueError right here, killing the lifespan's
+    # boot-migrate before the service comes up. Escape for storage; readers
+    # get the original URL back (configparser collapses `%%` to `%`).
+    cfg.set_main_option("sqlalchemy.url", (url or database_url()).replace("%", "%%"))
     return cfg
 
 

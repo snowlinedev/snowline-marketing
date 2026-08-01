@@ -82,7 +82,7 @@ def bind_port() -> int:
     if not raw:
         return DEFAULT_BIND_PORT
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         logging.getLogger(__name__).warning(
             "malformed MARKETING_BIND_PORT=%r — using the default %s",
@@ -90,6 +90,18 @@ def bind_port() -> int:
             DEFAULT_BIND_PORT,
         )
         return DEFAULT_BIND_PORT
+    if not 1 <= value <= 65535:
+        # 0 would bind an ephemeral OS-assigned port while MARKETING_BASE_URL
+        # keeps advertising the default to the platform — a healthily
+        # registered plugin the gateway can't reach; >65535 crashes uvicorn
+        # at startup. Same lenient warn-and-fall-back as the other knobs.
+        logging.getLogger(__name__).warning(
+            "out-of-range MARKETING_BIND_PORT=%r — using the default %s",
+            raw,
+            DEFAULT_BIND_PORT,
+        )
+        return DEFAULT_BIND_PORT
+    return value
 
 
 def marketing_enabled() -> bool:

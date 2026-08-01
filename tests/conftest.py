@@ -8,7 +8,8 @@ inherit a safe default without each one having to remember to set it.
 
 `migrated_db` mirrors the house plugin idiom: a disposable Postgres database,
 migrated with `alembic upgrade head` (exercising the migration chain), that
-`pytest.skip`s with a clear message when Postgres is unreachable — so the
+`pytest.skip`s with a clear message when Postgres is unreachable (or
+reachable but not provisionable by this role) — so the
 stub-based / registration / config tests that don't need a DB still run in an
 environment with no Postgres (e.g. plain CI with no service container).
 """
@@ -101,8 +102,15 @@ def migrated_db() -> str:
             "Postgres not reachable at "
             f"{_maintenance_url(TEST_DB_URL)!r} — DB-backed tests skipped"
         )
-    drop_database(TEST_DB_URL)
-    create_database(TEST_DB_URL)
+    try:
+        drop_database(TEST_DB_URL)
+        create_database(TEST_DB_URL)
+    except sa.exc.DBAPIError as exc:
+        # Reachable is not provisionable: a locked-down role can connect to
+        # the maintenance DB yet lack CREATEDB (or the right to terminate
+        # other sessions' backends). The fixture's contract is a clean skip,
+        # not a fixture ERROR that reds the suite.
+        pytest.skip(f"cannot provision disposable test database: {exc}")
     reset_engine()
     command.upgrade(alembic_config(), "head")
     yield TEST_DB_URL

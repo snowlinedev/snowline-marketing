@@ -42,8 +42,10 @@ def build_manifest(base_url: str | None = None) -> dict:
         "mcp_path": "/mcp",
         "health_path": "/health",
         # Plugin-path -> platform named-surface. Marketing's only surface for
-        # now maps `/mcp -> main`; the MCP tools it composes are a later item
-        # (spec §2), the manifest shape is stable ahead of that.
+        # now maps `/mcp -> main`; the spec defines no MCP surface yet (its
+        # operator surfaces, §11, arrive dashboard-first) — this is the house
+        # manifest shape, wired now so registration doesn't change shape when
+        # MCP tools do ship.
         "surfaces": {"/mcp": "main"},
     }
 

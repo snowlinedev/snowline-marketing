@@ -33,6 +33,16 @@ def test_chain_is_linear_from_genesis():
     assert forks == [], f"merge revisions found (branched history): {forks!r}"
 
 
+def test_alembic_config_survives_percent_in_url():
+    # Alembic's Config rides configparser interpolation: a percent-encoded
+    # credential (e.g. a password with `@` as `%40`) raised ValueError inside
+    # set_main_option before db.alembic_config escaped the URL for storage.
+    # Readers must get the ORIGINAL url back (configparser collapses %% -> %).
+    url = "postgresql+psycopg://user:p%40ss@localhost/db"
+    cfg = alembic_config(url)
+    assert cfg.get_main_option("sqlalchemy.url") == url
+
+
 def test_migration_chain_applies_cleanly(migrated_db):
     """DB-backed: `alembic upgrade head` (run by the `migrated_db` fixture)
     succeeds against a real database. Skips when Postgres is unreachable."""

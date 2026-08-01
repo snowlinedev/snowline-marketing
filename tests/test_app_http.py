@@ -42,14 +42,19 @@ def test_health_returns_200():
 
 
 def test_health_reports_marketing_enabled_flag(monkeypatch):
+    """LIFESPAN-FREE on purpose: this is the one test that overrides the
+    conftest autouse pin (MARKETING_ENABLED never true inside the suite), so
+    it must not enter the lifespan — once the intake/evaluation loops ride
+    the lifespan task group (stage 2), a full-lifespan run here would start
+    them for real mid-suite, exactly what the pin exists to prevent.
+    ASGITransport serves requests without the lifespan running."""
     monkeypatch.setenv("MARKETING_ENABLED", "1")
     app = _app()
 
     async def go() -> dict:
-        async with app.router.lifespan_context(app):
-            async with _http(app) as http:
-                r = await http.get("http://marketing/health")
-                return r.json()
+        async with _http(app) as http:
+            r = await http.get("http://marketing/health")
+            return r.json()
 
     assert anyio.run(go)["enabled"] is True
 

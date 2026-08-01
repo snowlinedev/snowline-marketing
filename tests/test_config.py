@@ -47,6 +47,14 @@ def test_bind_port_malformed_falls_back(monkeypatch):
     assert config.bind_port() == 8805
 
 
+def test_bind_port_out_of_range_falls_back(monkeypatch):
+    # 0 binds an ephemeral port while base_url keeps advertising the default
+    # (a registered-but-unreachable plugin); >65535 crashes uvicorn at boot.
+    for value in ("0", "-1", "70000"):
+        monkeypatch.setenv("MARKETING_BIND_PORT", value)
+        assert config.bind_port() == 8805, f"{value!r} should fall back"
+
+
 def test_database_url_default(monkeypatch):
     monkeypatch.delenv("MARKETING_DATABASE_URL", raising=False)
     assert config.database_url() == "postgresql+psycopg:///snowline_marketing"
