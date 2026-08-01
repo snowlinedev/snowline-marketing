@@ -2,14 +2,14 @@
   "schema_version": 1,
   "event_id": "pm-evt-0000101",
   "event_type": "item_completed",
-  "tenant": "turtles-edge",
+  "tenant": "turtlesedge",
   "occurred_at": "2026-07-14T16:32:05+00:00",
   "subject": {
     "kind": "work_item",
     "id": "3f1c9a20"
   },
   "payload": {
-    "scope": "turtles-edge/turtletracks",
+    "scope": "turtlesedge/turtletracks",
     "initiative": "summer-release",
     "phase": "build",
     "milestone": "v1.4",
@@ -22,7 +22,7 @@
     "external_refs": [
       {
         "kind": "pull_request",
-        "url": "https://github.com/turtles-edge/turtletracks/pull/214"
+        "url": "https://github.com/turtlesedge/turtletracks/pull/214"
       }
     ],
     "details": {

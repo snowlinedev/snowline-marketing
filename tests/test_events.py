@@ -24,8 +24,8 @@ from snowline_marketing.events import (
     parse_envelope,
 )
 
-TENANT = "turtles-edge"
-SCOPE = "turtles-edge/turtletracks"
+TENANT = "turtlesedge"
+SCOPE = "turtlesedge/turtletracks"
 
 
 def _envelope(event_type: EventType, **overrides) -> dict:
@@ -55,7 +55,7 @@ _TYPE_SPECIFIC: dict[EventType, dict] = {
     EventType.item_reopened: {},
     EventType.item_abandoned: {},
     EventType.item_rescoped: {
-        "payload": {"scope": SCOPE, "details": {"from_scope": "turtles-edge/legacy"}}
+        "payload": {"scope": SCOPE, "details": {"from_scope": "turtlesedge/legacy"}}
     },
     EventType.initiative_phase_completed: {
         "subject": {"kind": "initiative", "id": "8ad41b77", "phase": "build"},
@@ -181,7 +181,7 @@ MALFORMED_CASES = [
     ("missing subject", {"subject": None}, "subject"),
     ("unknown subject kind", {"subject": {"kind": "epic", "id": "x"}}, "kind"),
     ("missing payload scope", {"payload": {}}, "scope"),
-    ("unknown envelope field", {"org": "turtles-edge"}, "org"),
+    ("unknown envelope field", {"org": "turtlesedge"}, "org"),
 ]
 
 

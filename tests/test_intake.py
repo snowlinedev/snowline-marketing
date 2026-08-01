@@ -290,10 +290,10 @@ def test_loop_is_source_agnostic():
         "schema_version": 1,
         "event_id": "pm-evt-9001",
         "event_type": "item_completed",
-        "tenant": "turtles-edge",
+        "tenant": "turtlesedge",
         "occurred_at": "2026-07-20T12:00:00+00:00",
         "subject": {"kind": "work_item", "id": "3f1c9a20"},
-        "payload": {"scope": "turtles-edge/turtletracks"},
+        "payload": {"scope": "turtlesedge/turtletracks"},
     }
     store = InMemoryCursorStore()
     handler = Collector()

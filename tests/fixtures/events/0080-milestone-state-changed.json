@@ -2,14 +2,14 @@
   "schema_version": 1,
   "event_id": "pm-evt-0000108",
   "event_type": "milestone_state_changed",
-  "tenant": "turtles-edge",
+  "tenant": "turtlesedge",
   "occurred_at": "2026-07-18T10:00:00+00:00",
   "subject": {
     "kind": "milestone",
     "id": "ms-4c72a1"
   },
   "payload": {
-    "scope": "turtles-edge/turtletracks",
+    "scope": "turtlesedge/turtletracks",
     "milestone": "v1.4",
     "relations": [],
     "signals": [],

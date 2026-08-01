@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
   "event_type": "item_completed",
-  "tenant": "turtles-edge",
+  "tenant": "turtlesedge",
   "occurred_at": "2026-07-14T17:04:11+00:00",
   "subject": {
     "kind": "work_item",
     "id": "77aa3e01"
   },
   "payload": {
-    "scope": "turtles-edge/turtletracks",
+    "scope": "turtlesedge/turtletracks",
     "work_kind": "implementation",
     "details": {
       "title": "no dedup key — the ledger has nothing to key on"

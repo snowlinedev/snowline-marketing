@@ -2,14 +2,14 @@
   "schema_version": 1,
   "event_id": "pm-evt-0000106",
   "event_type": "item_rescoped",
-  "tenant": "turtles-edge",
+  "tenant": "turtlesedge",
   "occurred_at": "2026-07-16T08:21:37+00:00",
   "subject": {
     "kind": "work_item",
     "id": "9d0f5cc8"
   },
   "payload": {
-    "scope": "turtles-edge/turtletracks-web",
+    "scope": "turtlesedge/turtletracks-web",
     "initiative": "summer-release",
     "work_kind": "content",
     "relations": [],
@@ -17,7 +17,7 @@
     "external_refs": [],
     "details": {
       "title": "Landing page copy refresh",
-      "from_scope": "turtles-edge/turtletracks"
+      "from_scope": "turtlesedge/turtletracks"
     }
   }
 }

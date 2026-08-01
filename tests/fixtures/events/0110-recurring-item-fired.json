@@ -2,14 +2,14 @@
   "schema_version": 1,
   "event_id": "pm-evt-0000111",
   "event_type": "recurring_item_fired",
-  "tenant": "turtles-edge",
+  "tenant": "turtlesedge",
   "occurred_at": "2026-08-01T07:00:00+00:00",
   "subject": {
     "kind": "schedule",
     "id": "sched-monthly-metrics"
   },
   "payload": {
-    "scope": "turtles-edge/turtletracks",
+    "scope": "turtlesedge/turtletracks",
     "work_kind": "review",
     "relations": [],
     "signals": [],

@@ -2,14 +2,14 @@
   "schema_version": 1,
   "event_id": "pm-evt-0000113",
   "event_type": "semantic_signal",
-  "tenant": "turtles-edge",
+  "tenant": "turtlesedge",
   "occurred_at": "2026-08-01T09:30:12+00:00",
   "subject": {
     "kind": "work_item",
     "id": "e41b0d92"
   },
   "payload": {
-    "scope": "turtles-edge/turtletracks",
+    "scope": "turtlesedge/turtletracks",
     "initiative": "summer-release",
     "work_kind": "implementation",
     "relations": [
