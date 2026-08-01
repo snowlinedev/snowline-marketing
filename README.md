@@ -24,10 +24,24 @@ musher-dispatched runs.
 
 ## Status
 
-Spec-first, pre-implementation. See
+Spec-first, under active development. See
 [`docs/specs/marketing.md`](docs/specs/marketing.md) for the governing
 implementation spec, which implements the generalized marketing plugin
 product contract (Snowline governance artifact `b964d217`).
+
+## Development
+
+```sh
+uv sync                          # install deps (incl. dev group)
+uv run pytest                    # run the test suite
+uv run ruff check .              # lint
+uv run ruff format --check .     # format check
+uv run python -m snowline_marketing  # run the service (MARKETING_BIND_HOST/MARKETING_BIND_PORT; loopback:8805 by default)
+```
+
+The service is off by default: set `MARKETING_ENABLED=1` to enable the
+intake and evaluation loops once they exist. It always serves `/health`, and
+registers itself with the platform (`SNOWLINE_PLATFORM_URL`) on boot.
 
 ## License
 
