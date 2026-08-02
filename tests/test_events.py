@@ -274,11 +274,34 @@ def test_envelopes_hash_on_identity():
     assert len({a, b}) == 1
 
 
-def test_payload_is_explicitly_not_hashable():
-    # The payload has no identity of its own (free-form details); the frozen
-    # config would otherwise ADVERTISE hashability and raise an inscrutable
-    # mappingproxy TypeError from inside pydantic instead of this message.
+def test_payload_is_introspectably_not_hashable():
+    # The payload has no identity of its own (free-form details). Unhashability
+    # must be visible to isinstance gates BEFORE a container tries to hash —
+    # `__hash__ = None`, not a raising method that still advertises Hashable.
+    from collections.abc import Hashable
+
     parsed = parse_envelope(make_envelope(EventType.item_completed))
     assert isinstance(parsed, EventEnvelope)
-    with pytest.raises(TypeError, match="hash the EventEnvelope"):
+    assert not isinstance(parsed.payload, Hashable)
+    with pytest.raises(TypeError, match="unhashable"):
         hash(parsed.payload)
+
+
+def test_malformed_envelope_is_introspectably_not_hashable():
+    # Same trap as the payload: the frozen dataclass would auto-generate a
+    # field hash over `raw` (a dict in the live-outbox case) that raises only
+    # at runtime. Quarantine dedup keys on (source_key, position), not objects.
+    from collections.abc import Hashable
+
+    parsed = parse_envelope({"not": "an envelope"})
+    assert isinstance(parsed, MalformedEnvelope)
+    assert not isinstance(parsed, Hashable)
+
+
+def test_make_envelope_builds_isolated_copies():
+    # A test popping a nested key out of a built envelope must not contaminate
+    # the shared TYPE_SPECIFIC shapes for every later test in the session.
+    body = make_envelope(EventType.milestone_state_changed)
+    body["payload"]["details"].pop("to_state")
+    again = make_envelope(EventType.milestone_state_changed)
+    assert again["payload"]["details"]["to_state"] == "active"

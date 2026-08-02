@@ -79,7 +79,11 @@ class HandlerFailure:
     """The event a pass stopped on. `position` is un-acked, so the next pass
     starts by re-delivering exactly this event."""
 
-    position: str
+    # None when the pass failed in the READ machinery (the initial cursor
+    # read, or the source iterator itself) — there was no single event in
+    # hand to point at, and nothing was skipped: the next pass re-reads from
+    # the same cursor.
+    position: str | None
     event_id: str | None
     error: str
     # True when the malformed REPORT failed rather than the event handler —
@@ -91,6 +95,10 @@ class HandlerFailure:
     # pass, which the at-least-once contract makes safe; a driver seeing this
     # backs off rather than dead-lettering the event.
     while_acking: bool = False
+    # True when the failure was in READING — the cursor at pass start, or the
+    # source mid-iteration (an unreadable fixture directory, a dropped outbox
+    # connection). Also infra-shaped: nothing was handled and nothing acked.
+    while_reading: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,7 +151,6 @@ def run_intake(
     Returns rather than raises on a handler failure — see the module docstring
     on why the pass stops there and why the event stays un-acked."""
     source_key = source.source_key
-    after = cursor_store.read(source_key)
     report = on_malformed or _log_malformed
 
     delivered = 0
@@ -184,10 +191,50 @@ def run_intake(
                 while_acking=while_acking,
             )
 
+    # The initial cursor read is READ machinery, guarded like everything else:
+    # a DB blip at pass start is a returned failure, not a crashed driver.
+    try:
+        after = cursor_store.read(source_key)
+    except Exception as exc:
+        log.exception("cursor read for %s failed — pass never started", source_key)
+        return IntakeResult(
+            source_key=source_key,
+            delivered=0,
+            malformed=0,
+            acked_position=None,
+            failure=HandlerFailure(
+                position=None, event_id=None, error=repr(exc), while_reading=True
+            ),
+        )
+
     # islice, not enumerate+break: a bounded pass must consume EXACTLY `limit`
     # events from the source — pulling one extra means a wasted file read (or,
     # at cutover, a wasted outbox fetch) discarded and re-fetched every pass.
-    for raw in itertools.islice(source.read(after=after), limit):
+    # A negative limit clamps to an empty pass (islice would raise ValueError,
+    # and a driver whose dynamic bite size went negative asked for nothing,
+    # not for a crash).
+    events = itertools.islice(
+        source.read(after=after), max(0, limit) if limit is not None else None
+    )
+    while True:
+        # The source iterator is guarded too: it can raise lazily on any pull
+        # (an invalid fixture directory, a file deleted mid-pass, a dropped
+        # outbox connection at cutover). That is a READ failure — no event in
+        # hand, nothing skipped; the next pass re-reads from the same cursor.
+        try:
+            raw = next(events)
+        except StopIteration:
+            break
+        except Exception as exc:
+            log.exception(
+                "event source %s read failed — pass stopped, cursor unmoved",
+                source_key,
+            )
+            failure = HandlerFailure(
+                position=None, event_id=None, error=repr(exc), while_reading=True
+            )
+            break
+
         parsed = parse_envelope(raw.body, ref=raw.ref, position=raw.position)
         is_malformed = isinstance(parsed, MalformedEnvelope)
 

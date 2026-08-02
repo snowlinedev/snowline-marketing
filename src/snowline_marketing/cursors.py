@@ -83,11 +83,12 @@ class DbCursorStore:
     them — with the delivery ledger a later item, nothing dedups that yet. A
     stale ack is instead a silent no-op, which is what it should be.
 
-    The `<` is SQL text comparison, which matches stream order because the
-    `EventSource` contract requires positions to be LEXICOGRAPHICALLY monotone
-    (see sources.py) — the guard and the source ordering are the same
-    collation-independent ASCII shapes (zero-padded numeric prefixes, monotone
-    event ids) by contract."""
+    The `<` is pinned to `COLLATE "C"` (bytewise) on BOTH sides: the
+    `EventSource` contract defines monotone as PYTHON string order — bytewise
+    — and the database's default collation is not that (a linguistic ICU
+    collation orders punctuation-insensitively, so it could judge a
+    legitimate forward ack a rewind and silently wedge the cursor). One
+    ordering, declared where it is compared."""
 
     def read(self, source_key: str) -> str | None:
         with session_scope() as session:
@@ -114,7 +115,11 @@ class DbCursorStore:
                         "updated_at": func.now(),
                     },
                     # The rewind guard (see class docstring): a stale racing
-                    # ack must not move the cursor backward.
-                    where=ConsumerCursor.position < statement.excluded.position,
+                    # ack must not move the cursor backward. COLLATE "C" pins
+                    # the comparison to byte order — the same ordering the
+                    # sources and the in-memory store use — independent of the
+                    # database's default collation.
+                    where=ConsumerCursor.position.collate("C")
+                    < statement.excluded.position.collate("C"),
                 )
             )

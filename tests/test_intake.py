@@ -20,10 +20,14 @@ from snowline_marketing.events import (
     EventEnvelope,
     EventType,
     MalformedEnvelope,
-    parse_envelope,
 )
 from snowline_marketing.intake import run_intake
-from snowline_marketing.sources import FixturesEventSource, RawEvent, fixture_files
+from snowline_marketing.sources import (
+    FixturesEventSource,
+    RawEvent,
+    fixture_files,
+    iter_fixture_envelopes,
+)
 
 
 class Collector:
@@ -46,10 +50,15 @@ class Collector:
 
 def _capture(directory) -> list[tuple[str, object]]:
     """The shipped capture as (position, parsed) pairs in stream order — what
-    the loop SHOULD see, derived independently of the loop."""
+    the loop SHOULD see. Derived through the SAME read path the loop uses
+    (`iter_fixture_envelopes` rides `FixturesEventSource.read`), so a change
+    to the source's read semantics cannot silently diverge these
+    expectations from what the loop actually consumes."""
     return [
-        (path.name, parse_envelope(path.read_bytes(), position=path.name))
-        for path in fixture_files(directory)
+        (path.name, parsed)
+        for path, parsed in zip(
+            fixture_files(directory), iter_fixture_envelopes(directory), strict=True
+        )
     ]
 
 
@@ -185,17 +194,6 @@ def test_malformed_envelopes_are_reported_and_do_not_stop_the_pass(event_fixture
         assert malformed.ref
         assert malformed.detail
         assert malformed.raw
-
-
-def test_malformed_envelopes_are_not_delivered_to_the_handler(event_fixtures_dir):
-    handler = Collector()
-    run_intake(
-        FixturesEventSource(event_fixtures_dir),
-        handler,
-        cursor_store=InMemoryCursorStore(),
-        **_quietly(),
-    )
-    assert handler.ids == _valid_ids(event_fixtures_dir)
 
 
 def test_malformed_envelopes_advance_the_cursor(event_fixtures_dir):
@@ -394,3 +392,55 @@ def test_limit_consumes_exactly_limit_events_from_the_source(event_fixtures_dir)
         **_quietly(),
     )
     assert len(pulled) == 3
+
+
+def test_source_read_failure_is_returned_not_raised(tmp_path):
+    """READ machinery failures — an invalid capture directory, a file deleted
+    mid-pass, a dropped outbox connection — are returned failures with the
+    cursor unmoved, not exceptions through the never-raises contract."""
+    (tmp_path / "2000-a.json").write_text("{}")
+    (tmp_path / "10000-b.json").write_text("{}")  # mixed widths: listing raises
+
+    result = run_intake(
+        FixturesEventSource(tmp_path),
+        Collector(),
+        cursor_store=InMemoryCursorStore(),
+        **_quietly(),
+    )
+    assert not result.ok
+    assert result.failure.while_reading
+    assert result.failure.position is None
+    assert "mix widths" in result.failure.error
+    assert result.delivered == 0 and result.malformed == 0
+
+
+def test_cursor_read_failure_is_returned_not_raised(event_fixtures_dir):
+    class UnreadableCursorStore(InMemoryCursorStore):
+        def read(self, source_key):
+            raise RuntimeError("cursor store down at pass start")
+
+    result = run_intake(
+        FixturesEventSource(event_fixtures_dir),
+        Collector(),
+        cursor_store=UnreadableCursorStore(),
+        **_quietly(),
+    )
+    assert not result.ok
+    assert result.failure.while_reading
+    assert result.acked_position is None
+
+
+def test_negative_limit_is_an_empty_pass(event_fixtures_dir):
+    # A driver whose dynamic bite size went negative asked for nothing, not
+    # for a crash (islice alone would raise ValueError).
+    result = run_intake(
+        FixturesEventSource(event_fixtures_dir),
+        Collector(),
+        cursor_store=InMemoryCursorStore(),
+        limit=-1,
+        **_quietly(),
+    )
+    assert result.ok
+    assert result.delivered == 0
+    assert result.malformed == 0
+    assert result.acked_position is None

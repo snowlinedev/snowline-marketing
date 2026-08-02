@@ -185,16 +185,15 @@ class EventPayload(_Model):
         # round-trip through JSON is useless to a capture or a quarantine row.
         return dict(value)
 
-    def __hash__(self) -> int:
-        # `frozen=True` would otherwise generate a by-fields hash that RAISES
-        # at runtime (`details` is a mappingproxy over arbitrary JSON — not
-        # hashable), advertising a contract it cannot deliver. The payload has
-        # no identity of its own; hash the ENVELOPE, whose identity is
-        # (tenant, event_id).
-        raise TypeError(
-            "EventPayload is not hashable (details is a free-form mapping); "
-            "hash the EventEnvelope, whose identity is (tenant, event_id)"
-        )
+
+# Declared UNHASHABLE, introspectably: `frozen=True` would otherwise generate
+# a by-fields hash that raises at runtime (`details` is a mappingproxy over
+# arbitrary JSON), while still advertising `collections.abc.Hashable` — so a
+# consumer gating on Hashable before caching would accept the payload and
+# crash deep inside its container. `__hash__ = None` is the standard contract:
+# the isinstance check says no up front. The payload has no identity of its
+# own — hash the EventEnvelope.
+EventPayload.__hash__ = None  # type: ignore[assignment]
 
 
 # Which subject kinds each event type may legally have. A completion event
@@ -253,10 +252,13 @@ class EventEnvelope(_Model):
         # The generated frozen-model hash would recurse into `payload`, which
         # is unhashable by construction (free-form `details`). Hash on the
         # event's IDENTITY instead: `tenant + event_id` is the spec's dedup
-        # key (§4 — the ledger scopes it per policy), so two envelopes that
-        # compare equal necessarily share it, keeping the eq/hash contract.
-        # This is what lets a driver or ledger hold `set[EventEnvelope]`
-        # across re-deliveries.
+        # key (§4 — the ledger scopes it per policy). Equality stays pydantic's
+        # FIELD-BASED eq — two envelopes that compare equal necessarily share
+        # the identity, so the eq/hash contract holds — which means a set
+        # dedups IDENTICAL envelopes only. Deduping re-deliveries whose
+        # content a producer refreshed is deliberately NOT a set's job: key on
+        # `(envelope.tenant, envelope.event_id)` explicitly (as the delivery
+        # ledger does), or content differences silently vanish.
         return hash((self.tenant, self.event_id))
 
     @field_validator("occurred_at", mode="after")
@@ -345,6 +347,12 @@ class MalformedEnvelope:
     position: str | None = None
     event_id: str | None = None
 
+
+# Same introspectable unhashability as EventPayload: the frozen dataclass
+# would auto-generate a field hash over `raw` — arbitrary JSON, a dict in the
+# live-outbox case — that raises only at runtime. Quarantine-side dedup keys
+# on (source_key, position), never on the object.
+MalformedEnvelope.__hash__ = None  # type: ignore[assignment]
 
 # What intake gets back for any one event: understood, or explained.
 ParsedEnvelope = EventEnvelope | MalformedEnvelope

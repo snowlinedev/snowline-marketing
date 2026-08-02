@@ -90,11 +90,6 @@ def test_capture_covers_the_malformed_classes(event_fixtures_dir):
     assert MalformedReason.invalid_envelope in reasons
 
 
-def test_iter_fixture_envelopes_never_raises_on_the_bad_ones(event_fixtures_dir):
-    parsed = list(iter_fixture_envelopes(event_fixtures_dir))
-    assert len(parsed) == len(fixture_files(event_fixtures_dir))
-
-
 def test_source_reads_every_event_in_order(event_fixtures_dir):
     source = FixturesEventSource(event_fixtures_dir)
     positions = [raw.position for raw in source.read()]

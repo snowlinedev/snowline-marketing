@@ -21,6 +21,7 @@ environment with no Postgres (e.g. plain CI with no service container).
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 
@@ -101,7 +102,12 @@ TYPE_SPECIFIC = _type_specific()
 
 def make_envelope(event_type, **overrides) -> dict:
     """A minimal VALID envelope dict for `event_type` — only what that type
-    requires, so a test that mutates one field is testing that field."""
+    requires, so a test that mutates one field is testing that field.
+
+    The type-specific shape is DEEP-COPIED in: tests mutate the envelopes they
+    build (popping a nested key is the natural way to probe a required-field
+    path), and a by-reference share would let one test's mutation contaminate
+    `TYPE_SPECIFIC` for every later test in the session."""
     from snowline_marketing.events import SCHEMA_VERSION
 
     base: dict = {
@@ -113,7 +119,7 @@ def make_envelope(event_type, **overrides) -> dict:
         "subject": {"kind": "work_item", "id": "3f1c9a20"},
         "payload": {"scope": SCOPE},
     }
-    base.update(TYPE_SPECIFIC[event_type])
+    base.update(copy.deepcopy(TYPE_SPECIFIC[event_type]))
     for key, value in overrides.items():
         base[key] = value
     return base
