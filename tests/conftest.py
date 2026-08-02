@@ -6,6 +6,11 @@ SNOWLINE_SHADOW_TURNS_ENABLED). There is no intake/policy loop yet to
 accidentally start, but the gate is pinned now so future engine tests
 inherit a safe default without each one having to remember to set it.
 
+`event_fixtures_dir` points at the captured event envelopes in
+`tests/fixtures/events/` — the shipped v1 stream (every event type, plus
+malformed cases), shared by the source, intake-loop and envelope tests so they
+all assert against the SAME capture rather than each inventing its own.
+
 `migrated_db` mirrors the house plugin idiom: a disposable Postgres database,
 migrated with `alembic upgrade head` (exercising the migration chain), that
 `pytest.skip`s with a clear message when Postgres is unreachable (or
@@ -16,9 +21,14 @@ environment with no Postgres (e.g. plain CI with no service container).
 
 from __future__ import annotations
 
+import copy
 import os
+from pathlib import Path
 
 import pytest
+
+# The shipped capture (spec §5: fixtures mode is a first-class dev/CI surface).
+EVENT_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "events"
 
 # Point marketing's DB layer at the disposable test database BEFORE any
 # marketing module builds its (lazy) engine.
@@ -35,6 +45,104 @@ from alembic import command  # noqa: E402
 # one place); safe to import before the fixtures run — the DB layer is lazy.
 from snowline_marketing.db import alembic_config, reset_engine  # noqa: E402
 
+# The tenant/scope slugs every test and fixture speaks — the REAL Turtle's
+# Edge slugs, so a captured fixture and a hand-built envelope can't drift
+# apart on identity.
+TENANT = "turtlesedge"
+SCOPE = "turtlesedge/turtletracks"
+
+
+# The per-type shape each event REQUIRES (spec §5 subject refs + §6 predicate
+# surface). Keyed by every EventType member — test_events asserts the
+# coverage, so a new event type cannot be added without landing here. Lives in
+# conftest because BOTH test_events (contract tests) and test_intake (a
+# source-agnostic loop test) build envelopes from it — one source of truth for
+# the minimal-valid shape.
+def _type_specific() -> dict:
+    from snowline_marketing.events import EventType
+
+    return {
+        EventType.item_completed: {},
+        EventType.item_reopened: {},
+        EventType.item_abandoned: {},
+        EventType.item_rescoped: {
+            "payload": {"scope": SCOPE, "details": {"from_scope": "turtlesedge/legacy"}}
+        },
+        EventType.initiative_phase_completed: {
+            "subject": {"kind": "initiative", "id": "8ad41b77", "phase": "build"},
+            "payload": {
+                "scope": SCOPE,
+                "initiative": "summer-release",
+                "phase": "build",
+            },
+        },
+        EventType.milestone_state_changed: {
+            "subject": {"kind": "milestone", "id": "ms-4c72a1"},
+            "payload": {
+                "scope": SCOPE,
+                "milestone": "v1.4",
+                "details": {"from_state": "planned", "to_state": "active"},
+            },
+        },
+        EventType.milestone_released: {
+            "subject": {"kind": "milestone", "id": "ms-4c72a1"},
+            "payload": {"scope": SCOPE, "milestone": "v1.4"},
+        },
+        EventType.recurring_item_fired: {
+            "subject": {"kind": "schedule", "id": "sched-monthly-metrics"},
+        },
+        EventType.semantic_signal: {
+            "payload": {"scope": SCOPE, "signals": ["marketing-impact"]},
+        },
+    }
+
+
+TYPE_SPECIFIC = _type_specific()
+
+
+def make_envelope(event_type, **overrides) -> dict:
+    """A minimal VALID envelope dict for `event_type` — only what that type
+    requires, so a test that mutates one field is testing that field.
+
+    The type-specific shape is DEEP-COPIED in: tests mutate the envelopes they
+    build (popping a nested key is the natural way to probe a required-field
+    path), and a by-reference share would let one test's mutation contaminate
+    `TYPE_SPECIFIC` for every later test in the session."""
+    from snowline_marketing.events import SCHEMA_VERSION
+
+    base: dict = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": f"pm-evt-{event_type.value}",
+        "event_type": event_type.value,
+        "tenant": TENANT,
+        "occurred_at": "2026-07-20T12:00:00+00:00",
+        "subject": {"kind": "work_item", "id": "3f1c9a20"},
+        "payload": {"scope": SCOPE},
+    }
+    base.update(copy.deepcopy(TYPE_SPECIFIC[event_type]))
+    for key, value in overrides.items():
+        base[key] = value
+    return base
+
+
+@pytest.fixture(autouse=True)
+def _cursor_rows_do_not_leak(request):
+    """Any DB-backed test leaves `consumer_cursors` EMPTY behind it. Cursor
+    rows key on source_key alone, and `FixturesEventSource`'s default key is
+    derived from the directory NAME — so a row leaked by one test silently
+    becomes another test's resume point, an execution-order-dependent flake in
+    exactly the isolation area this suite exists to nail down."""
+    yield
+    if "migrated_db" not in request.fixturenames:
+        return
+    import sqlalchemy as sa_
+
+    from snowline_marketing.db import session_scope
+    from snowline_marketing.models import ConsumerCursor
+
+    with session_scope() as session:
+        session.execute(sa_.delete(ConsumerCursor))
+
 
 @pytest.fixture(autouse=True)
 def _marketing_stays_disabled(monkeypatch):
@@ -44,6 +152,12 @@ def _marketing_stays_disabled(monkeypatch):
     evaluation mid-test. Symmetric to the platform's
     SNOWLINE_SHADOW_TURNS_ENABLED pin."""
     monkeypatch.setenv("MARKETING_ENABLED", "0")
+
+
+@pytest.fixture
+def event_fixtures_dir() -> Path:
+    """The shipped event capture directory (see module docstring)."""
+    return EVENT_FIXTURES_DIR
 
 
 def _db_name(url: str) -> str:

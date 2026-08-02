@@ -6,9 +6,9 @@ database URL is read when a session is actually opened — which lets tests
 point at a disposable database and avoids connecting just by importing the
 package.
 
-No models are defined yet (spec §13 stage 1 is scaffold-only — no ledger
-tables); this module exists so the alembic env and the app lifespan's
-boot-migrate have something real to import.
+The only model so far is the intake `ConsumerCursor` (spec §4); the ledger,
+provenance and quarantine tables arrive with their own items. Everything here
+is model-agnostic — it owns connections, not schema.
 """
 
 from __future__ import annotations

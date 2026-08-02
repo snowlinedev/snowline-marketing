@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000105",
+  "event_type": "item_archived",
+  "tenant": "turtlesedge",
+  "occurred_at": "2026-07-15T12:00:00+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "b62d4417"
+  },
+  "payload": {
+    "scope": "turtlesedge/turtletracks",
+    "details": {
+      "note": "a type this consumer has no mapping for — unmapped, not ignored"
+    }
+  }
+}

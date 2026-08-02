@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000113",
+  "event_type": "semantic_signal",
+  "tenant": "turtlesedge",
+  "occurred_at": "2026-08-01T09:30:12+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "e41b0d92"
+  },
+  "payload": {
+    "scope": "turtlesedge/turtletracks",
+    "initiative": "summer-release",
+    "work_kind": "implementation",
+    "relations": [
+      {"kind": "marketing-impact", "target": "8ad41b77"}
+    ],
+    "signals": ["marketing-impact", "store-listing-affecting"],
+    "external_refs": [],
+    "details": {
+      "title": "Trip export formats",
+      "set_at": "triage"
+    }
+  }
+}
