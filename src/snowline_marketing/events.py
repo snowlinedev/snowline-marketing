@@ -222,9 +222,20 @@ _REQUIRED_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
 }
 
 # The payload fields EVERY event type guarantees (schema-required, never
-# None). Everything else on the predicate surface is Optional unless
-# `_REQUIRED_PAYLOAD_FIELDS` requires it for the specific type.
-ALWAYS_PRESENT_PAYLOAD_FIELDS = frozenset({"scope"})
+# None). DERIVED from the model, not hand-listed: pydantic's required-field
+# set IS the guarantee, and a mirror maintained by hand would keep claiming it
+# after someone relaxed a field to Optional — letting dedup templates validate
+# against a guarantee that no longer holds.
+ALWAYS_PRESENT_PAYLOAD_FIELDS = frozenset(
+    name for name, field in EventPayload.model_fields.items() if field.is_required()
+)
+
+# Every payload field that is guaranteed for at least one event type via
+# `_REQUIRED_PAYLOAD_FIELDS` — the conditional half of the dedup-template
+# vocabulary, derived for the same reason as above.
+CONDITIONAL_PAYLOAD_FIELDS = frozenset(
+    field for fields in _REQUIRED_PAYLOAD_FIELDS.values() for field in fields
+)
 
 
 def guaranteed_payload_fields(event_type: EventType) -> frozenset[str]:
@@ -343,6 +354,17 @@ class MalformedReason(enum.StrEnum):
     not_an_object = "not_an_object"
     # A JSON object that does not satisfy the envelope contract.
     invalid_envelope = "invalid_envelope"
+
+
+# Import-time pin: `parse_envelope` maps `classify.DecodeFailure` into this
+# enum by VALUE. A decode failure added in classify.py without a member here
+# would turn the never-raises malformed path into a ValueError at runtime —
+# and intake calls parse_envelope outside any try, so one bad event would
+# kill the sweep. Fail at import instead, where the suite cannot miss it.
+if not {f.value for f in classify.DecodeFailure} <= {r.value for r in MalformedReason}:
+    raise AssertionError(
+        "MalformedReason must cover every classify.DecodeFailure value"
+    )
 
 
 @dataclass(frozen=True)

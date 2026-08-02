@@ -92,7 +92,11 @@ from pydantic import (
 )
 
 from snowline_marketing import classify
-from snowline_marketing.events import EventType, guaranteed_payload_fields
+from snowline_marketing.events import (
+    CONDITIONAL_PAYLOAD_FIELDS,
+    EventType,
+    guaranteed_payload_fields,
+)
 
 # The policy-set body's own version, independent of the envelope's. Bumped only
 # when the POLICY shape changes incompatibly; a body declaring any other
@@ -144,7 +148,7 @@ DEDUP_KEY_FIELDS_ALWAYS = frozenset(
 # guarantees it — otherwise the template validates and then renders the
 # constant "None" key that silently swallows every later delivery, the exact
 # failure parse-time validation exists to catch.
-DEDUP_KEY_FIELDS_CONDITIONAL = frozenset({"initiative", "phase", "milestone"})
+DEDUP_KEY_FIELDS_CONDITIONAL = CONDITIONAL_PAYLOAD_FIELDS
 DEDUP_KEY_FIELDS = DEDUP_KEY_FIELDS_ALWAYS | DEDUP_KEY_FIELDS_CONDITIONAL
 
 
@@ -365,6 +369,19 @@ def _validate_dedup_template(
             f"placeholder(s) {', '.join(repr(u) for u in unknown)} — known "
             f"placeholders are {', '.join(sorted(DEDUP_KEY_FIELDS))}"
         )
+    # Final gate: DRY-RENDER with sentinel string values. The engine renders
+    # every placeholder from string fields, so whatever the explicit arms
+    # above did not name — a type-incompatible spec like `{event_id:d}`, a
+    # datetime code on a string — must fail HERE at parse time, not per
+    # matched event at mint time (a policy that fails only on the events it
+    # matches is the failure mode this whole function exists to prevent).
+    try:
+        template.format(**{field: "sentinel" for field in DEDUP_KEY_FIELDS})
+    except Exception as exc:
+        raise ValueError(
+            f"policy {policy_id!r}: dedup_key_template {template!r} does not "
+            f"render against string values ({exc})"
+        ) from exc
     # A conditional placeholder must be GUARANTEED by every event type this
     # entry selects — Optional-but-absent renders the constant "None" key.
     for field in sorted(set(fields) & DEDUP_KEY_FIELDS_CONDITIONAL):
@@ -453,6 +470,18 @@ class MalformedPolicyReason(enum.StrEnum):
     # attribute one tenant's rules to another's audit trail — the cross-tenant
     # misrepresentation §3/§14 forbid.
     tenant_mismatch = "tenant_mismatch"
+
+
+# Import-time pin: `parse_policy_set` maps `classify.DecodeFailure` into this
+# enum by VALUE. A decode failure added in classify.py without a member here
+# would turn the never-raises malformed path into a ValueError at runtime —
+# fail at import instead, where the suite cannot miss it.
+if not {f.value for f in classify.DecodeFailure} <= {
+    r.value for r in MalformedPolicyReason
+}:
+    raise AssertionError(
+        "MalformedPolicyReason must cover every classify.DecodeFailure value"
+    )
 
 
 @dataclass(frozen=True)

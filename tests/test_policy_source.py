@@ -300,3 +300,18 @@ def test_an_empty_body_resolves_for_the_parser_to_quarantine():
     assert isinstance(resolved, ResolvedPolicySet), resolved
     assert resolved.body == ""
     assert resolved.version_id == VERSION_ID
+
+
+def test_a_broken_ssl_env_does_not_escape(monkeypatch):
+    # httpx builds the SSL context eagerly in the Client constructor, so a
+    # broken SSL_CERT_FILE raises FileNotFoundError (an OSError, outside the
+    # httpx hierarchy) from the lazy construction — it must come back as
+    # 'unavailable', not crash the sweep.
+    def boom(*args, **kwargs):
+        raise FileNotFoundError("/nonexistent/ca-bundle.pem")
+
+    monkeypatch.setattr(httpx, "Client", boom)
+    result = GatewayPolicyProvider("http://governance.example").resolve(TENANT)
+    assert isinstance(result, PolicyResolutionError)
+    assert result.failure is ResolutionFailure.unavailable
+    assert "ca-bundle" in result.detail

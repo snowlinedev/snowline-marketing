@@ -64,7 +64,7 @@ from typing import Protocol
 
 import httpx
 
-from snowline_marketing import config
+from snowline_marketing import classify, config
 
 log = logging.getLogger("snowline_marketing.policy_source")
 
@@ -241,16 +241,18 @@ class GatewayPolicyProvider:
                 # nothing here is locked.
                 self._client = httpx.Client(timeout=self._timeout)
             resp = self._client.get(url, params=params, timeout=self._timeout)
-        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
-            # A typo'd MARKETING_GOVERNANCE_URL must land here as a typed
-            # result, not escape the never-raises contract — and it takes all
-            # three arms to guarantee that. `InvalidURL` is not an `HTTPError`
-            # (it subclasses Exception directly), and a base URL malformed
-            # enough that the request never reaches the transport at all
-            # (`http:/gov.example`, a missing scheme) surfaces as a bare
-            # `ValueError` from urllib underneath httpx, which is in no httpx
-            # hierarchy whatsoever. The config typo is precisely the failure an
-            # operator hits, so it is the one this must not crash on.
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as exc:
+            # A config error must land here as a typed result, not escape the
+            # never-raises contract — and it takes all four arms to guarantee
+            # that. `InvalidURL` is not an `HTTPError` (it subclasses
+            # Exception directly); a base URL malformed enough that the
+            # request never reaches the transport (`http:/gov.example`, a
+            # missing scheme) surfaces as a bare `ValueError` from urllib; and
+            # the lazy `httpx.Client()` construction above raises `OSError`
+            # (FileNotFoundError) on a broken SSL_CERT_FILE — httpx builds the
+            # SSL context eagerly in the constructor. The config typo is
+            # precisely the failure an operator hits, so it is the one this
+            # must not crash on.
             log.warning("policy resolution for %r failed at %s: %s", tenant, url, exc)
             return PolicyResolutionError(
                 tenant=tenant,
@@ -268,11 +270,8 @@ class GatewayPolicyProvider:
             # tenant it is answering for. A bare framework 404 (FastAPI's
             # {"detail": "Not Found"}) is treated as unavailable — stall
             # visibly, let the operator find the deployment problem.
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = None
-            if isinstance(payload, Mapping) and payload.get("tenant") == tenant:
+            payload, _decode_failure = classify.decode_json_object(resp.content)
+            if payload is not None and payload.get("tenant") == tenant:
                 return PolicyResolutionError(
                     tenant=tenant,
                     failure=ResolutionFailure.not_found,
@@ -312,20 +311,17 @@ def _read_version_payload(tenant: str, resp: httpx.Response) -> ResolutionResult
     the worst possible thing to paper over — the ledger would record the
     evaluated version as unknown, which is the one fact the contract requires
     it to have."""
-    try:
-        payload = resp.json()
-    except ValueError as exc:
+    # The decode skeleton is classify.py's, same as both parsers — a third
+    # hand-rolled decoder here would silently miss the next hardening fix
+    # (httpx's resp.json() is json.loads(resp.content) underneath, so this is
+    # a drop-in).
+    payload, decode_failure = classify.decode_json_object(resp.content)
+    if decode_failure is not None:
+        failure, detail = decode_failure
         return PolicyResolutionError(
             tenant=tenant,
             failure=ResolutionFailure.malformed_response,
-            detail=f"governance returned non-JSON: {exc}",
-            status_code=resp.status_code,
-        )
-    if not isinstance(payload, Mapping):
-        return PolicyResolutionError(
-            tenant=tenant,
-            failure=ResolutionFailure.malformed_response,
-            detail=f"expected a JSON object, got {type(payload).__name__}",
+            detail=f"governance response: {failure.value} — {detail}",
             status_code=resp.status_code,
         )
     version_id = payload.get(_VERSION_ID_KEY)

@@ -11,14 +11,19 @@ quotes when revising a broken artifact.
 
 Two design points worth stating, because both look like omissions:
 
-**No guarded upsert.** `cursors.DbCursorStore.ack` guards its `ON CONFLICT`
-with a rewind check, because a stale racing writer there would move a cursor
-BACKWARD and re-deliver a span. Nothing analogous exists here: a governance
-artifact version id is an immutable content address, so two writers racing on
-the same key are necessarily writing the SAME body, and last-writer-wins
-converges on the identical row. The only column that moves is `fetched_at`, and
-the later of two concurrent fetches is the right answer for it. A guard would
-be ceremony protecting against a state that cannot occur.
+**The upsert is guarded on TENANT, not on content.** `cursors.DbCursorStore.ack`
+guards against rewinds; the racing-writer story here is different. For
+GOVERNANCE-issued version ids — immutable content addresses — two writers on
+the same key necessarily write the same body and last-writer-wins converges,
+so no content guard is needed. But version ids are the CALLER's to choose on
+the fixtures/dry-run path (`InMemoryPolicyProvider`), and nothing stops two
+tenants' dry-runs reusing a readable id like `pv-0001` — an unguarded upsert
+would let the second silently rewrite the first tenant's row, stealing the
+version out of its listing and re-pointing any ledger row that recorded it at
+the other tenant's policy text. So the conflict update applies only when the
+row's tenant matches; a cross-tenant collision is REFUSED (logged, row
+unchanged) rather than absorbed. `fetched_at` still advances on every
+same-tenant re-fetch — the later fetch is the right answer for it.
 
 **No "current version" column, and no invalidation.** Which version is current
 is governance's answer, re-resolved per sweep (spec §5: governance is polled,
@@ -40,6 +45,7 @@ re-classifies; nothing has to be migrated, and no stale parse silently governs.
 from __future__ import annotations
 
 import enum
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -89,8 +95,16 @@ class CachedPolicyVersion:
         """Re-derive the policy model from the stored body (see the module
         docstring on why this is not stored pre-parsed). Carries the version id
         through, so a `MalformedPolicySet` produced here still names the
-        governance version an operator has to revise."""
-        return parse_policy_set(self.body, version_id=self.version_id)
+        governance version an operator has to revise.
+
+        `expected_tenant` is the ROW's tenant — the same cross-check `put`
+        applied at write time. Without it, a row stored as
+        quarantined/tenant_mismatch would re-parse here as a fully valid
+        `PolicySet` for the OTHER tenant, and the engine would evaluate across
+        the §3/§14 boundary that the write-side check exists to hold."""
+        return parse_policy_set(
+            self.body, version_id=self.version_id, expected_tenant=self.tenant
+        )
 
 
 class PolicyCache:
@@ -135,6 +149,7 @@ class PolicyCache:
             # on the operator surface.
             reason = None
             detail = None
+        log_ = logging.getLogger("snowline_marketing.policy_cache")
         statement = pg_insert(CachedPolicySetRow).values(
             version_id=version_id,
             tenant=tenant,
@@ -144,7 +159,7 @@ class PolicyCache:
             quarantine_detail=detail,
         )
         with session_scope() as session:
-            session.execute(
+            result = session.execute(
                 statement.on_conflict_do_update(
                     index_elements=[CachedPolicySetRow.version_id],
                     set_={
@@ -160,8 +175,22 @@ class PolicyCache:
                         # sweep look stalled.
                         "fetched_at": statement.excluded.fetched_at,
                     },
+                    # The cross-tenant guard (see module docstring): a
+                    # caller-chosen id colliding across tenants must not
+                    # rewrite another tenant's row.
+                    where=CachedPolicySetRow.tenant == statement.excluded.tenant,
                 )
             )
+            if result.rowcount == 0:
+                # The conflict row belongs to ANOTHER tenant — refused, loudly.
+                # Only reachable with caller-chosen ids (dry-run/fixtures);
+                # governance ids are unique by construction.
+                log_.warning(
+                    "policy cache put refused: version id %r already cached "
+                    "for a different tenant (requested for %r) — row unchanged",
+                    version_id,
+                    tenant,
+                )
         return parsed
 
     def get(self, version_id: str) -> CachedPolicyVersion | None:

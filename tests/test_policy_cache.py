@@ -247,6 +247,12 @@ def test_a_tenant_mismatched_body_quarantines(migrated_db):
     assert row.outcome is ParseOutcome.quarantined
     assert row.quarantine_reason == MalformedPolicyReason.tenant_mismatch.value
     assert {r.version_id for r in cache.list_for_tenant("snowlinedev")} == {"gv-cross"}
+    # The READ path applies the same cross-check: re-parsing the row must not
+    # hand the engine a valid PolicySet for the wrong tenant while the row's
+    # own audit column says quarantined.
+    reparsed = row.parse()
+    assert isinstance(reparsed, MalformedPolicySet)
+    assert reparsed.reason is MalformedPolicyReason.tenant_mismatch
 
 
 def test_a_quarantined_row_needs_a_detail_too(migrated_db):
@@ -271,3 +277,22 @@ def test_a_quarantined_row_needs_a_detail_too(migrated_db):
                 "ck_policy_cache_quarantine_reason did not reject a quarantined "
                 "row with no detail"
             )
+
+
+def test_a_cross_tenant_id_collision_is_refused(migrated_db):
+    # Version ids are caller-chosen on the dry-run/fixtures path, so two
+    # tenants CAN reuse a readable id. The second put must not rewrite the
+    # first tenant's row — the version would vanish from its listing and any
+    # ledger row recording it would join to the other tenant's policy text.
+    import json
+
+    cache = PolicyCache()
+    cache.put(_resolved("pv-0001", VALID_BODY, tenant=TENANT))
+    other = json.loads(VALID_BODY)
+    other["tenant"] = "snowlinedev"
+    cache.put(_resolved("pv-0001", json.dumps(other), tenant="snowlinedev"))
+
+    row = cache.get("pv-0001")
+    assert row is not None
+    assert row.tenant == TENANT  # first writer keeps the row
+    assert row.body == VALID_BODY

@@ -160,8 +160,15 @@ def _plugin_tables_do_not_leak(request):
     from snowline_marketing.models import Base
 
     with session_scope() as session:
+        # Filter against the tables that actually exist: a model landed ahead
+        # of its migration (exactly the workflow this fixture anticipates)
+        # must not make the first UndefinedTable abort the WHOLE cleanup —
+        # that would error every DB test in teardown and, because the
+        # transaction rolls back, reintroduce the leakage on top.
+        existing = set(sa_.inspect(session.get_bind()).get_table_names())
         for table in reversed(Base.metadata.sorted_tables):
-            session.execute(sa_.delete(table))
+            if table.name in existing:
+                session.execute(sa_.delete(table))
 
 
 @pytest.fixture(autouse=True)

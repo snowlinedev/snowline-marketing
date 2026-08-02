@@ -546,3 +546,14 @@ def test_models_are_frozen():
     assert isinstance(parsed, PolicySet)
     with pytest.raises(Exception):
         parsed.policies[0].mode = PolicyMode.dry_run
+
+
+def test_type_incompatible_format_spec_is_malformed():
+    # '{event_id:d}' names a known field with no nested spec and no bad
+    # conversion — only the dry-render gate catches that ':d' cannot format a
+    # string, which would otherwise crash per matched event at mint time.
+    parsed = parse_policy_set(
+        _set(_entry("p1") | {"dedup_key_template": "{tenant}:{policy_id}:{event_id:d}"})
+    )
+    assert isinstance(parsed, MalformedPolicySet)
+    assert "does not render" in parsed.detail
