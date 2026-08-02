@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "tenant": "turtlesedge",
+  "policies": [
+    {
+      "policy_id": "messaging-refresh-on-marketing-impact",
+      "event_types": ["item_completed"],
+      "consequence": "messaging_refresh",
+      "destination": {
+        "scope": "turtlesedge/marketing"
+      },
+      "title_template": "Refresh messaging",
+      "body_template": "A body written against a policy schema this deploy does not understand. Quarantine, not a best-effort parse."
+    }
+  ]
+}

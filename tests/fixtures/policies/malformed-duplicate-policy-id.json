@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "tenant": "turtlesedge",
+  "policies": [
+    {
+      "policy_id": "listing-regeneration-on-release",
+      "event_types": ["milestone_released"],
+      "consequence": "listing_regeneration",
+      "destination": {
+        "scope": "turtlesedge/marketing"
+      },
+      "title_template": "Regenerate the App Store listing for {milestone}",
+      "body_template": "The first entry claiming this policy_id."
+    },
+    {
+      "policy_id": "listing-regeneration-on-release",
+      "event_types": ["item_completed"],
+      "consequence": "screenshot_review",
+      "destination": {
+        "scope": "turtlesedge/marketing"
+      },
+      "title_template": "Review screenshots",
+      "body_template": "The second entry claiming it. policy_id is part of the delivery ledger's dedup key, so these two would dedup each other's work away."
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "policy_id": "messaging-refresh-on-marketing-impact",
+    "event_types": ["item_completed"],
+    "consequence": "messaging_refresh",
+    "destination": {
+      "scope": "turtlesedge/marketing"
+    },
+    "title_template": "Refresh messaging",
+    "body_template": "A bare list of entries: valid JSON, but not a policy SET — it names no tenant and no schema version, so nothing says whose rules these are."
+  }
+]

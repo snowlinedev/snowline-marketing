@@ -1,0 +1,6 @@
+# Turtle's Edge marketing policies
+
+Governance stores artifact bodies as text, so an artifact revised to prose is
+a real accident rather than a hypothetical one: the policy set is gone and the
+body still resolves. This is why the cache column is Text and why the parser
+classifies rather than raises.

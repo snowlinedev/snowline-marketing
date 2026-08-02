@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "tenant": "turtlesedge",
+  "policies": [
+    {
+      "policy_id": "messaging-refresh-on-marketing-impact",
+      "event_types": ["item_completed", "item_archived"],
+      "consequence": "messaging_refresh",
+      "destination": {
+        "scope": "turtlesedge/marketing"
+      },
+      "title_template": "Refresh messaging for {subject_title}",
+      "body_template": "A selector this plugin's intake vocabulary does not contain: 'item_archived' is not an EventType, so the rule the operator believes is armed would never fire."
+    }
+  ]
+}

@@ -50,7 +50,6 @@ Constraints this module encodes, and why:
 from __future__ import annotations
 
 import enum
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -67,6 +66,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from snowline_marketing import classify
 
 # The envelope's own version. Bumped only when the ENVELOPE shape changes
 # incompatibly; a producer speaking any other version is malformed here rather
@@ -220,6 +221,34 @@ _REQUIRED_PAYLOAD_FIELDS: dict[EventType, tuple[str, ...]] = {
     EventType.milestone_released: ("milestone",),
 }
 
+# The payload fields EVERY event type guarantees (schema-required, never
+# None). DERIVED from the model, not hand-listed: pydantic's required-field
+# set IS the guarantee, and a mirror maintained by hand would keep claiming it
+# after someone relaxed a field to Optional — letting dedup templates validate
+# against a guarantee that no longer holds.
+ALWAYS_PRESENT_PAYLOAD_FIELDS = frozenset(
+    name for name, field in EventPayload.model_fields.items() if field.is_required()
+)
+
+# Every payload field that is guaranteed for at least one event type via
+# `_REQUIRED_PAYLOAD_FIELDS` — the conditional half of the dedup-template
+# vocabulary, derived for the same reason as above.
+CONDITIONAL_PAYLOAD_FIELDS = frozenset(
+    field for fields in _REQUIRED_PAYLOAD_FIELDS.values() for field in fields
+)
+
+
+def guaranteed_payload_fields(event_type: EventType) -> frozenset[str]:
+    """The payload fields `event_type` is VALIDATED to carry — never None on
+    a parsed envelope. Public because the policy schema checks dedup-key
+    templates against what an entry's selected event types actually
+    guarantee: a template referencing a merely-Optional field would render
+    the constant "None" key that silently swallows every later delivery."""
+    return ALWAYS_PRESENT_PAYLOAD_FIELDS | frozenset(
+        _REQUIRED_PAYLOAD_FIELDS.get(event_type, ())
+    )
+
+
 # `details` keys required per type — the type-specific facts that carry the
 # event's actual news. A state change that does not say what it changed TO,
 # or a re-scope that does not say where it came FROM, is not a usable event:
@@ -327,6 +356,17 @@ class MalformedReason(enum.StrEnum):
     invalid_envelope = "invalid_envelope"
 
 
+# Import-time pin: `parse_envelope` maps `classify.DecodeFailure` into this
+# enum by VALUE. A decode failure added in classify.py without a member here
+# would turn the never-raises malformed path into a ValueError at runtime —
+# and intake calls parse_envelope outside any try, so one bad event would
+# kill the sweep. Fail at import instead, where the suite cannot miss it.
+if not {f.value for f in classify.DecodeFailure} <= {r.value for r in MalformedReason}:
+    raise AssertionError(
+        "MalformedReason must cover every classify.DecodeFailure value"
+    )
+
+
 @dataclass(frozen=True)
 class MalformedEnvelope:
     """A rejected envelope, kept whole.
@@ -357,22 +397,6 @@ MalformedEnvelope.__hash__ = None  # type: ignore[assignment]
 # What intake gets back for any one event: understood, or explained.
 ParsedEnvelope = EventEnvelope | MalformedEnvelope
 
-# Quarantine reasons are read by humans in a table cell; a wildly wrong body
-# under `extra="forbid"` can produce one error per stray field, so the detail
-# is capped rather than unbounded.
-_MAX_REPORTED_ERRORS = 5
-
-
-def _compact_errors(exc: ValidationError) -> str:
-    errors = exc.errors()
-    parts = [
-        f"{'.'.join(str(p) for p in err['loc']) or '<root>'}: {err['msg']}"
-        for err in errors[:_MAX_REPORTED_ERRORS]
-    ]
-    if len(errors) > _MAX_REPORTED_ERRORS:
-        parts.append(f"(+{len(errors) - _MAX_REPORTED_ERRORS} more)")
-    return "; ".join(parts)
-
 
 def parse_envelope(
     raw: object,
@@ -385,41 +409,32 @@ def parse_envelope(
     Accepts either an already-decoded mapping (the live outbox hands back
     rows) or JSON text/bytes (the fixtures source hands back file contents
     undecoded, so "not JSON" classifies as malformed here instead of blowing
-    up mid-iteration inside the source).
+    up mid-iteration inside the source). The decode/validate skeleton is
+    `classify.py`, shared with `parse_policy_set`.
 
     Never raises. `ref` and `position` are locators the caller knows and this
     function only carries through, so a `MalformedEnvelope` is self-contained
     for the quarantine store that persists it later."""
-    body: object = raw
-    if isinstance(body, (str, bytes, bytearray)):
-        try:
-            body = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            return MalformedEnvelope(
-                reason=MalformedReason.not_json,
-                detail=str(exc),
-                raw=raw,
-                ref=ref,
-                position=position,
-            )
-    if not isinstance(body, Mapping):
+    body, decode_failure = classify.decode_json_object(raw)
+    if decode_failure is not None:
+        failure, detail = decode_failure
         return MalformedEnvelope(
-            reason=MalformedReason.not_an_object,
-            detail=f"expected a JSON object, got {type(body).__name__}",
+            # By-value mapping: DecodeFailure's values are this enum's values.
+            reason=MalformedReason(failure.value),
+            detail=detail,
             raw=raw,
             ref=ref,
             position=position,
         )
     # Best-effort id BEFORE validation: an envelope can be malformed for some
     # other reason and still carry the id the quarantine row wants to key on.
-    candidate_id = body.get("event_id")
-    event_id = candidate_id.strip() or None if isinstance(candidate_id, str) else None
+    event_id = classify.best_effort_str(body, "event_id")
     try:
         return EventEnvelope.model_validate(dict(body))
     except ValidationError as exc:
         return MalformedEnvelope(
             reason=MalformedReason.invalid_envelope,
-            detail=_compact_errors(exc),
+            detail=classify.compact_errors(exc),
             raw=raw,
             ref=ref,
             position=position,
