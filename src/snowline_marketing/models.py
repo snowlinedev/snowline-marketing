@@ -275,10 +275,12 @@ class DeliveryLedgerEntry(Base):
             "'quarantined', 'failed')",
             name="ck_delivery_ledger_outcome",
         ),
-        # Policy-level outcomes must name the rule that produced them; only the
-        # event-level ones (no policy was involved) may leave it NULL.
+        # Both directions: policy-level outcomes must name the rule that
+        # produced them, and the event-level ones (facts about an EVENT — no
+        # rule was involved) must NOT — an ignored row claiming a policy puts
+        # a rule's name on a decision it never made, the same lie in reverse.
         CheckConstraint(
-            "policy_id IS NOT NULL OR outcome IN ('ignored', 'quarantined')",
+            "(policy_id IS NULL) = (outcome IN ('ignored', 'quarantined'))",
             name="ck_delivery_ledger_policy_id",
         ),
         # The §6 contract requirement, enforced rather than trusted: a matched /
@@ -288,8 +290,13 @@ class DeliveryLedgerEntry(Base):
             "policy_version_id IS NOT NULL OR outcome IN ('ignored', 'quarantined')",
             name="ck_delivery_ledger_policy_version_id",
         ),
+        # Both directions here too: a `created` row with nothing to point at
+        # claims work exists that nobody can find, and an item ref on a row
+        # whose outcome never says `created` is work the audit trail cannot
+        # account for. (The minting layer therefore advances outcome and ref
+        # in one UPDATE — which is the honest shape of that transition anyway.)
         CheckConstraint(
-            "outcome <> 'created' OR created_item_ref IS NOT NULL",
+            "(created_item_ref IS NOT NULL) = (outcome = 'created')",
             name="ck_delivery_ledger_created_item_ref",
         ),
         CheckConstraint(

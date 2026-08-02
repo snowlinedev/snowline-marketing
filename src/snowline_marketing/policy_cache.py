@@ -55,6 +55,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from snowline_marketing.db import session_scope
 from snowline_marketing.models import CachedPolicySet as CachedPolicySetRow
 from snowline_marketing.policies import (
+    MalformedPolicyReason,
     MalformedPolicySet,
     ParsedPolicySet,
     parse_policy_set,
@@ -127,7 +128,14 @@ class PolicyCache:
         another's name. Parsing inside `put` (and returning the result for
         the caller to evaluate) is what makes the row's classification
         UNABLE to disagree with its body: there is no API through which a
-        caller can hand in a parsed result derived from something else."""
+        caller can hand in a parsed result derived from something else.
+
+        When the tenant-guarded upsert REFUSES the write (the version id is
+        already another tenant's row), the parsed set is NOT returned even if
+        it was valid: the caller gets a `MalformedPolicySet` with reason
+        `version_collision`, and the tenant stalls as quarantined rather than
+        evaluating a version whose audit join points at someone else's
+        policy text."""
         version_id = resolved.version_id
         tenant = resolved.tenant
         body = resolved.body
@@ -188,14 +196,39 @@ class PolicyCache:
                 .returning(CachedPolicySetRow.version_id)
             )
             if applied.first() is None:
-                # The conflict row belongs to ANOTHER tenant — refused, loudly.
-                # Only reachable with caller-chosen ids (dry-run/fixtures);
-                # governance ids are unique by construction.
+                # The conflict row belongs to ANOTHER tenant — refused, loudly,
+                # and NOT returned as the parsed set. A valid parse handed back
+                # from here would evaluate against a version the cache refused
+                # to record, so every ledger row naming this version id would
+                # join to the OTHER tenant's policy text — a broken audit join
+                # is worse than a stalled tenant. Returned as a
+                # `MalformedPolicySet` instead, which the engine's existing
+                # quarantine path turns into a visible PolicyQuarantined stall
+                # until the collision is resolved. Only reachable with
+                # caller-chosen ids (dry-run/fixtures); governance ids are
+                # unique by construction.
+                holder = session.scalar(
+                    select(CachedPolicySetRow.tenant).where(
+                        CachedPolicySetRow.version_id == version_id
+                    )
+                )
                 log_.warning(
                     "policy cache put refused: version id %r already cached "
                     "for a different tenant (requested for %r) — row unchanged",
                     version_id,
                     tenant,
+                )
+                return MalformedPolicySet(
+                    reason=MalformedPolicyReason.version_collision,
+                    detail=(
+                        f"version id {version_id!r} is already cached for "
+                        f"tenant {holder!r}; refused for tenant {tenant!r} — "
+                        "the row is unchanged and the audit join is broken "
+                        "until the collision is resolved"
+                    ),
+                    raw=body,
+                    version_id=version_id,
+                    tenant=tenant,
                 )
         return parsed
 

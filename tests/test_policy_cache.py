@@ -312,15 +312,47 @@ def test_a_cross_tenant_id_collision_is_refused(migrated_db):
     # tenants CAN reuse a readable id. The second put must not rewrite the
     # first tenant's row — the version would vanish from its listing and any
     # ledger row recording it would join to the other tenant's policy text.
+    # And the refused put must NOT hand back the parsed valid set: with the
+    # row refused, the audit join is broken, so the caller gets a
+    # `version_collision` MalformedPolicySet and the tenant stalls as
+    # quarantined until the collision is resolved.
     import json
+
+    from snowline_marketing.engine import (
+        EvaluationStalled,
+        StallReason,
+        resolve_policy_set,
+    )
+    from snowline_marketing.policy_source import InMemoryPolicyProvider
 
     cache = PolicyCache()
     cache.put(_resolved("pv-0001", VALID_BODY, tenant=TENANT))
     other = json.loads(VALID_BODY)
     other["tenant"] = "snowlinedev"
-    cache.put(_resolved("pv-0001", json.dumps(other), tenant="snowlinedev"))
+    other_body = json.dumps(other)
+    refused = cache.put(_resolved("pv-0001", other_body, tenant="snowlinedev"))
+
+    assert isinstance(refused, MalformedPolicySet)
+    assert refused.reason is MalformedPolicyReason.version_collision
+    # The detail names the version id and BOTH tenants — the row's holder and
+    # the requester — which is everything the operator needs to untangle it.
+    assert "pv-0001" in refused.detail
+    assert TENANT in refused.detail and "snowlinedev" in refused.detail
+    assert refused.version_id == "pv-0001"
+    assert refused.tenant == "snowlinedev"
+    assert refused.raw == other_body
 
     row = cache.get("pv-0001")
     assert row is not None
     assert row.tenant == TENANT  # first writer keeps the row
     assert row.body == VALID_BODY
+
+    # ...and evaluation for the refused tenant STALLS as PolicyQuarantined —
+    # the engine's existing MalformedPolicySet path, with no new plumbing.
+    provider = InMemoryPolicyProvider()
+    provider.put("snowlinedev", "pv-0001", other_body)
+    resolution = resolve_policy_set("snowlinedev", provider=provider, cache=cache)
+    assert isinstance(resolution, EvaluationStalled)
+    assert resolution.reason is StallReason.policy_quarantined
+    assert resolution.version_id == "pv-0001"
+    assert "version_collision" in resolution.detail

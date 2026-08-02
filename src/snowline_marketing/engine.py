@@ -39,8 +39,24 @@ with the position un-acked, records the failure, and returns). The event is
 still in the source; the next pass re-delivers it; when the provider recovers
 the same event evaluates normally. That is the whole recovery story, and it
 works because it composes with the ledger's unique key: re-delivery is safe
-precisely because a delivery that already converged reports `deduplicated`
-rather than doing the work twice (spec §4, "recoverably convergent").
+because the existing row says how far the work got, and the delivery answers
+accordingly (spec §4, "recoverably convergent").
+
+**Recoverable convergence, spelled out.** For a matched entry the ledger row
+and the mint are two separate durable steps, so a crash can land between them:
+the row says `matched` and the item ref the minting layer (§7) writes on
+success is still NULL. Such a row is a claim on work that was never produced,
+and re-delivery is the recovery — the conflicting delivery re-emits the
+consequence, keyed to the SAME row, instead of reporting `deduplicated` and
+losing the work forever. Only a row that shows the work was produced (outcome
+`created`, or a non-null item ref) answers a repeat delivery with
+`deduplicated` and no consequence. The re-emitted consequence carries the
+CURRENT policy entry and version while the row keeps the version that first
+claimed the key: the row is the audit of the claim as it was decided, and the
+mint that eventually happens is the one the current policy would produce —
+which is the honest answer for work being done now. Event-level rows
+(`ignored`/`quarantined`) have no second step, so a repeat delivery of one is
+always `deduplicated`.
 
 **Cross-tenant deliveries are consumed, not stalled.** An envelope whose tenant
 is not the one being evaluated will never match legitimately no matter how many
@@ -56,8 +72,9 @@ to act is the one who owns this stream.
 from __future__ import annotations
 
 import enum
-import string
-from dataclasses import dataclass, field
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from snowline_marketing.events import EventEnvelope
 from snowline_marketing.ledger import (
@@ -67,12 +84,14 @@ from snowline_marketing.ledger import (
 )
 from snowline_marketing.matching import matching_entries
 from snowline_marketing.policies import (
+    DEDUP_KEY_FIELDS,
     ConsequenceType,
     MalformedPolicySet,
     PolicyDestination,
     PolicyEntry,
     PolicyMode,
     PolicySet,
+    dedup_template_fields,
 )
 from snowline_marketing.policy_cache import PolicyCache
 from snowline_marketing.policy_source import (
@@ -87,15 +106,19 @@ from snowline_marketing.policy_source import (
 # They live in the same column and under the same unique key as policy keys, on
 # purpose: one uniqueness mechanism covers every outcome, so a re-delivered
 # unmatched event converges to its single audit row exactly the way a matched
-# one does, instead of accumulating a row per delivery. The shapes are namespaced
-# by a trailing literal that the default template cannot produce. A COLLISION
-# with a policy key is possible only for a tenant who authored a template
-# rendering the identical string — which for the default shape would need a
-# policy whose id equals the event id and an event id literally "ignored" — and
-# even then the consequence is a deduplicated delivery, never a cross-tenant
-# read: `tenant` is a column of the key, not a rendered substring.
+# one does, instead of accumulating a row per delivery. The shapes are PLAIN —
+# no distinguishing literal of their own — because the LEDGER namespaces every
+# key it stores ("e:" for event-level writes, "p:" for policy-level ones; see
+# ledger.py). That is what makes these shapes unforgeable: a tenant-authored
+# template that rendered this exact string would be a policy-level write and
+# store under "p:", so it can never collide with — or read back — an
+# event-level row.
 IGNORED_DEDUP_KEY_TEMPLATE = "{tenant}:{event_id}:ignored"
-QUARANTINED_DEDUP_KEY_TEMPLATE = "{tenant}:{event_id}:quarantined"
+# The quarantine key names the ENVELOPE's declared tenant, per breach: two
+# misrouted envelopes from different foreign orgs sharing an event id are two
+# distinct routing failures, and folding them into one row would leave the
+# second breach with no record of its own.
+QUARANTINED_DEDUP_KEY_TEMPLATE = "{tenant}:{event_id}:quarantined:{envelope_tenant}"
 
 
 class StallReason(enum.StrEnum):
@@ -188,10 +211,13 @@ class PendingConsequence:
     provenance. Both objects are frozen, so passing them whole costs nothing
     and cannot be edited in flight.
 
-    `dedup_key` is the ledger row this consequence belongs to: the minting layer
-    writes the created item's ref back to `(tenant, dedup_key)`, turning
-    `matched` into `created` (§4). It is the handle, and it is already claimed —
-    a consequence exists only when THIS delivery won the insert."""
+    `dedup_key` is the ledger row this consequence belongs to — the STORED,
+    store-namespaced key (`ledger.py`): the minting layer writes the created
+    item's ref back to `(tenant, dedup_key)`, turning `matched` into `created`
+    (§4). It is the handle, and the row already exists — a consequence is
+    emitted only when this delivery won the insert, or when the existing row is
+    a `matched` claim whose mint never happened and the work is re-owed (the
+    module docstring's recoverable convergence)."""
 
     tenant: str
     envelope: EventEnvelope
@@ -238,22 +264,32 @@ class Delivery:
     """One event × one policy (or one event, for the event-level outcomes).
 
     Two outcomes live here and they are not the same question. `outcome` is what
-    THIS delivery decided — `matched` when it claimed the key, `deduplicated`
-    when it found the key already taken, `ignored`/`quarantined` for the
-    event-level rows on their first delivery. `record.outcome` is what the ROW
-    says, which on a repeat delivery is whatever the earlier one left there —
-    possibly `created`, with a PM item ref beside it. They coincide on a fresh
-    delivery and diverge on every repeat, and both are worth having: the first
-    answers "what did this pass do?", the second answers "what is the state of
-    this work?" (spec §4: re-delivery returns the existing result).
+    THIS delivery decided — `matched` when it claimed the key (or found it
+    claimed but the work still owed — see the module docstring's recoverable
+    convergence), `deduplicated` when the key's row shows the work was already
+    produced, `failed` when a within-evaluation key collision refused the
+    delivery, `ignored`/`quarantined` for the event-level rows on their first
+    delivery. `record.outcome` is what the ROW says, which on a repeat delivery
+    is whatever the earlier one left there — possibly `created`, with a PM item
+    ref beside it. They coincide on a fresh delivery and diverge on every
+    repeat, and both are worth having: the first answers "what did this pass
+    do?", the second answers "what is the state of this work?" (spec §4:
+    re-delivery returns the existing result).
 
-    `consequence` is non-None exactly when `outcome is matched`. A repeat
-    delivery produces none — that is the dedup, and it is why running the intake
-    loop twice over the same capture mints once."""
+    `consequence` is non-None exactly when `outcome is matched` — including the
+    re-owed repeat of a match that never minted; that convergence is why
+    running the intake loop over the same capture, with minting doing its job,
+    mints once.
+
+    `detail` is the operator-facing note for the deliveries whose outcome alone
+    does not explain itself (today: the within-evaluation key collision
+    reported as `failed`). Distinct from `record.detail`, which belongs to the
+    ROW — a collision delivery deliberately never wrote one."""
 
     outcome: DeliveryOutcome
     record: LedgerRecord
     consequence: PendingConsequence | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -271,7 +307,11 @@ class EvaluationResult:
     # in play) — the same nullability the ledger column carries, for the same
     # reason.
     policy_version_id: str | None
-    deliveries: tuple[Delivery, ...] = field(default_factory=tuple)
+    # Required, no default: every consumed event carries at least one delivery
+    # (see the class docstring), and a default here would let a code path
+    # construct the "nothing happened, trust me" result the type exists to
+    # forbid.
+    deliveries: tuple[Delivery, ...]
 
     @property
     def consequences(self) -> tuple[PendingConsequence, ...]:
@@ -370,37 +410,55 @@ def resolve_policy_set(
     )
 
 
+# The render vocabulary, pinned: one renderer per field in
+# `policies.DEDUP_KEY_FIELDS`, each a function of the (entry, envelope) pair.
+# Every value is a STRING (or None, for the conditional fields an envelope may
+# lack), which is what `policies._validate_dedup_template` dry-rendered against
+# at parse time; enum-valued fields are passed as their wire values so a key
+# never depends on Python's repr of an enum member.
+_DEDUP_KEY_VALUES: dict[str, Callable[[PolicyEntry, EventEnvelope], str | None]] = {
+    "tenant": lambda entry, envelope: envelope.tenant,
+    "policy_id": lambda entry, envelope: entry.policy_id,
+    "event_id": lambda entry, envelope: envelope.event_id,
+    "event_type": lambda entry, envelope: envelope.event_type.value,
+    "entity_kind": lambda entry, envelope: envelope.subject.kind.value,
+    "entity_id": lambda entry, envelope: envelope.subject.id,
+    "scope": lambda entry, envelope: envelope.payload.scope,
+    "consequence": lambda entry, envelope: entry.consequence.value,
+    # The conditional half of the vocabulary: Optional on the payload, and
+    # guaranteed present only for the event types that require them — which
+    # parse-time validation already confirmed for every type an entry selects.
+    "initiative": lambda entry, envelope: envelope.payload.initiative,
+    "phase": lambda entry, envelope: envelope.payload.phase,
+    "milestone": lambda entry, envelope: envelope.payload.milestone,
+}
+
+# Import-time pin: the render vocabulary IS `policies.DEDUP_KEY_FIELDS`. A
+# field admitted to the template vocabulary without a renderer here would
+# validate at parse time and then be unrenderable per matched event; a renderer
+# without a vocabulary entry would be dead weight advertising a field no
+# template may use. Either drift fails at import, where the suite cannot miss
+# it.
+if set(_DEDUP_KEY_VALUES) != DEDUP_KEY_FIELDS:
+    raise AssertionError(
+        "engine's dedup-key render vocabulary must equal policies.DEDUP_KEY_FIELDS"
+    )
+
+
 def render_dedup_key(entry: PolicyEntry, envelope: EventEnvelope) -> str:
     """Render `entry`'s dedup-key template against `envelope` (spec §4).
 
-    Every value is a STRING, which is what `policies._validate_dedup_template`
-    dry-rendered against at parse time; enum-valued fields are passed as their
-    wire values so a key never depends on Python's repr of an enum member.
+    The values come from `_DEDUP_KEY_VALUES` (the pinned render vocabulary) and
+    the referenced fields from `policies.dedup_template_fields` — the same,
+    cached parse validation used — so the hot path never re-parses a template
+    and the two ends of the contract cannot drift.
 
     A referenced field that is None raises rather than rendering "None" — see
     `DedupKeyUnrenderable` for why that trade is not close."""
     values: dict[str, str | None] = {
-        "tenant": envelope.tenant,
-        "policy_id": entry.policy_id,
-        "event_id": envelope.event_id,
-        "event_type": envelope.event_type.value,
-        "entity_kind": envelope.subject.kind.value,
-        "entity_id": envelope.subject.id,
-        "scope": envelope.payload.scope,
-        "consequence": entry.consequence.value,
-        # The conditional half of the vocabulary: Optional on the payload, and
-        # guaranteed present only for the event types that require them —
-        # which parse-time validation already confirmed for every type this
-        # entry selects.
-        "initiative": envelope.payload.initiative,
-        "phase": envelope.payload.phase,
-        "milestone": envelope.payload.milestone,
+        name: value_of(entry, envelope) for name, value_of in _DEDUP_KEY_VALUES.items()
     }
-    referenced = {
-        name
-        for _, name, _, _ in string.Formatter().parse(entry.dedup_key_template)
-        if name
-    }
+    referenced = dedup_template_fields(entry.dedup_key_template)
     missing = sorted(name for name in referenced if values.get(name) is None)
     if missing:
         raise DedupKeyUnrenderable(
@@ -444,12 +502,14 @@ def evaluate(
     )
 
     def event_level(
-        outcome: DeliveryOutcome, template: str, detail: str
+        outcome: DeliveryOutcome, dedup_key: str, detail: str
     ) -> EvaluationResult:
-        """One row for the whole event — no policy, no consequence."""
+        """One row for the whole event — no policy, no consequence. The store
+        files the key under its event-level namespace ("e:", ledger.py), which
+        is what keeps these reserved shapes out of any policy's reach."""
         write = ledger.record(
             tenant=tenant,
-            dedup_key=template.format(tenant=tenant, event_id=envelope.event_id),
+            dedup_key=dedup_key,
             event_id=envelope.event_id,
             event_type=envelope.event_type.value,
             outcome=outcome,
@@ -484,7 +544,11 @@ def evaluate(
         # nullable for the case where no set existed at all.
         return event_level(
             DeliveryOutcome.quarantined,
-            QUARANTINED_DEDUP_KEY_TEMPLATE,
+            QUARANTINED_DEDUP_KEY_TEMPLATE.format(
+                tenant=tenant,
+                event_id=envelope.event_id,
+                envelope_tenant=envelope.tenant,
+            ),
             f"cross-tenant delivery: envelope declares tenant "
             f"{envelope.tenant!r}, evaluated for tenant {tenant!r} — rejected "
             "with quarantine, never routed across the isolation boundary",
@@ -492,7 +556,11 @@ def evaluate(
 
     if isinstance(resolution, NoPolicySet):
         return event_level(
-            DeliveryOutcome.ignored, IGNORED_DEDUP_KEY_TEMPLATE, resolution.detail
+            DeliveryOutcome.ignored,
+            IGNORED_DEDUP_KEY_TEMPLATE.format(
+                tenant=tenant, event_id=envelope.event_id
+            ),
+            resolution.detail,
         )
 
     if resolution.policy_set.tenant != envelope.tenant:
@@ -503,7 +571,16 @@ def evaluate(
         # refactor away from not being held at all.
         return event_level(
             DeliveryOutcome.quarantined,
-            QUARANTINED_DEDUP_KEY_TEMPLATE,
+            # The envelope's declared tenant is the evaluated tenant on this
+            # branch (the mismatch is the POLICY SET's declaration), so the
+            # per-breach suffix converges every such refusal of one event on
+            # one row — which is right: it is one routing state, however many
+            # times it re-delivers.
+            QUARANTINED_DEDUP_KEY_TEMPLATE.format(
+                tenant=tenant,
+                event_id=envelope.event_id,
+                envelope_tenant=envelope.tenant,
+            ),
             f"policy version {resolution.version_id!r} declares tenant "
             f"{resolution.policy_set.tenant!r} but was evaluated for "
             f"{envelope.tenant!r} — refused",
@@ -513,14 +590,54 @@ def evaluate(
     if not entries:
         return event_level(
             DeliveryOutcome.ignored,
-            IGNORED_DEDUP_KEY_TEMPLATE,
+            IGNORED_DEDUP_KEY_TEMPLATE.format(
+                tenant=tenant, event_id=envelope.event_id
+            ),
             f"no entry of policy version {resolution.version_id!r} selects "
             f"event type {envelope.event_type.value!r} with this payload",
         )
 
     deliveries: list[Delivery] = []
+    # The within-evaluation collision guard: rendered key -> the delivery that
+    # claimed it in THIS evaluation. Defence in depth behind the parse-time
+    # identical-template check, which cannot see two DIFFERENT templates whose
+    # field VALUES happen to coincide on one envelope.
+    claimed: dict[str, Delivery] = {}
     for entry in entries:
         dedup_key = render_dedup_key(entry, envelope)
+        earlier = claimed.get(dedup_key)
+        if earlier is not None:
+            # Two entries of one evaluation rendered the same key. The ledger
+            # is NOT touched: the row belongs to the earlier entry, and writing
+            # (or reading back) under this entry's name would silently swallow
+            # its work as a duplicate of a different policy's — the one
+            # forbidden outcome. `failed` is §11's retry/dead-letter
+            # vocabulary: an operator-visible signal on the delivery, with the
+            # detail saying exactly which two policies collided.
+            detail = (
+                f"dedup-key collision within one evaluation: policy "
+                f"{entry.policy_id!r} rendered key {dedup_key!r}, already "
+                f"rendered by policy {earlier.record.policy_id!r} for event "
+                f"{envelope.event_id!r} — delivery refused, not recorded; the "
+                "ledger row belongs to the earlier policy"
+            )
+            logging.getLogger("snowline_marketing.engine").error(
+                "dedup-key collision for tenant %r: policies %r and %r both "
+                "rendered %r for event %r",
+                tenant,
+                earlier.record.policy_id,
+                entry.policy_id,
+                dedup_key,
+                envelope.event_id,
+            )
+            deliveries.append(
+                Delivery(
+                    outcome=DeliveryOutcome.failed,
+                    record=earlier.record,
+                    detail=detail,
+                )
+            )
+            continue
         write = ledger.record(
             tenant=tenant,
             dedup_key=dedup_key,
@@ -535,28 +652,42 @@ def evaluate(
             # policy version that may since have been revised.
             detail=f"matched in mode {entry.mode.value!r}",
         )
-        if not write.inserted:
-            # The key was already claimed — by an earlier pass, by a re-delivery
-            # after a crash, or by a racing process. No consequence: the earlier
-            # delivery owns the work, and its row (possibly already `created`,
-            # with an item ref) is the result this delivery returns. Spec §4.
-            deliveries.append(
-                Delivery(outcome=DeliveryOutcome.deduplicated, record=write.record)
-            )
-            continue
-        deliveries.append(
-            Delivery(
+        record = write.record
+        if not write.inserted and not (
+            record.outcome is DeliveryOutcome.matched
+            and record.created_item_ref is None
+        ):
+            # The key was already claimed AND the row shows the work was
+            # produced — outcome `created`, or an item ref already written.
+            # No consequence: the earlier delivery's result stands, and this
+            # is the one case a repeat delivery owes nothing. Spec §4.
+            delivery = Delivery(outcome=DeliveryOutcome.deduplicated, record=record)
+        else:
+            # Either this delivery won the insert, or the existing row is a
+            # `matched` claim with no item ref — a mint that never happened
+            # (a crash between the ledger commit and §7's mint/ack, or a mint
+            # still in flight). Both owe the same thing: a consequence, keyed
+            # to the row that holds the claim. This is spec §4's "recoverably
+            # convergent" (module docstring): the consequence is built from
+            # the CURRENT entry and version — the row may keep an older
+            # version id, and correctly so, because the row audits the claim
+            # as it was decided while the mint that eventually happens is the
+            # one the current policy would produce.
+            delivery = Delivery(
                 outcome=DeliveryOutcome.matched,
-                record=write.record,
+                record=record,
                 consequence=PendingConsequence(
                     tenant=tenant,
                     envelope=envelope,
                     entry=entry,
                     policy_version_id=resolution.version_id,
-                    dedup_key=dedup_key,
+                    # The STORED key (namespaced by the ledger) — the handle
+                    # §7 writes the created item's ref back to.
+                    dedup_key=record.dedup_key,
                 ),
             )
-        )
+        claimed[dedup_key] = delivery
+        deliveries.append(delivery)
     return EvaluationResult(
         tenant=tenant,
         envelope=envelope,
@@ -572,8 +703,9 @@ class EvaluationHandler:
     acks), raises `EvaluationStalledError` for a stall (the loop stops the pass,
     leaves the position un-acked, and records the failure). Together with the
     ledger's unique key that is the recoverable convergence spec §4 asks for —
-    the event re-delivers, the deliveries that already converged report
-    `deduplicated`, and the ones that never ran finally run.
+    the event re-delivers, the deliveries whose work was produced report
+    `deduplicated`, the ones whose mint never happened re-owe it, and the ones
+    that never ran finally run.
 
     **One resolution per pass, resolved lazily.** The policy version is fetched
     on the FIRST event and reused for the rest: a resolution per event would be

@@ -36,6 +36,16 @@ Every consequence of that choice is deliberate:
   ledger is where "did anyone already do this?" is answered, so it must be
   answered by the database, not by a flag in a process.
 
+- **The store owns the key namespace.** Every stored `dedup_key` is prefixed by
+  `record` itself — "p:" for policy-level rows, "e:" for event-level rows,
+  derived from whether the write names a policy (which the consistency guard in
+  `record` makes equivalent to the outcome's level). Callers render keys; they
+  cannot choose the namespace. That is what makes the engine's reserved
+  event-level shapes UNFORGEABLE: a tenant-authored template that renders
+  "e:whatever" is a policy-level write and stores as "p:e:whatever", so it can
+  never collide with — or read back — a reserved event-level row. Reads take
+  the STORED key, i.e. the namespaced string `LedgerRecord.dedup_key` reports.
+
 This module deliberately knows nothing about policies, envelopes or matching.
 It stores what it is told, and the engine decides what to tell it — which is
 what lets the ledger be tested against a real database with no policy artifact
@@ -78,10 +88,14 @@ class DeliveryOutcome(enum.StrEnum):
     - `quarantined` — the delivery was refused rather than evaluated (today:
       a cross-tenant envelope, §14). Consumed, explained, never silently
       dropped.
-    - `failed` — a delivery whose consequence could not be carried out. NOT
-      produced by this item: retry, backoff and dead-lettering are spec §11,
-      and the value is defined now so that the schema, the CHECK and the
-      dashboard vocabulary do not need a migration when §11 lands.
+    - `failed` — a delivery whose consequence could not be carried out. As a
+      ROW outcome it is NOT produced by this item: retry, backoff and
+      dead-lettering are spec §11, and the value is defined now so that the
+      schema, the CHECK and the dashboard vocabulary do not need a migration
+      when §11 lands. The engine does report `failed` on a DELIVERY — without
+      writing a row — for a within-evaluation dedup-key collision
+      (`engine.evaluate`), the operator-visible alternative to silently
+      swallowing one policy's work as another's.
     """
 
     matched = "matched"
@@ -94,9 +108,14 @@ class DeliveryOutcome(enum.StrEnum):
 
 # The outcomes that describe an EVENT rather than a rule, and are therefore the
 # only ones allowed to carry no policy id and no evaluated policy version (see
-# the CHECK constraints in models.py). Kept here so the store's guard and the
-# database's guard are the same list, read from one place.
+# the CHECK constraints in models.py). Kept here so the store's guard in
+# `record` and the database's CHECK are the same list, read from one place.
 EVENT_LEVEL_OUTCOMES = frozenset({DeliveryOutcome.ignored, DeliveryOutcome.quarantined})
+
+# The key namespaces (see the module docstring): prepended by `record`, never
+# by callers, so an event-level shape cannot be forged from a policy template.
+_POLICY_KEY_NAMESPACE = "p:"
+_EVENT_KEY_NAMESPACE = "e:"
 
 
 @dataclass(frozen=True)
@@ -153,11 +172,24 @@ class DeliveryLedger:
     ) -> LedgerWrite:
         """Claim `dedup_key` for `tenant`, or report who holds it already.
 
+        The stored key is `dedup_key` under the store's own namespace — "e:"
+        for an event-level write, "p:" for a policy-level one, derived from
+        `policy_id`'s presence (see the module docstring). The returned
+        record carries the stored, namespaced key, which is what every read
+        takes.
+
         Never updates an existing row (see the module docstring): on conflict
         the stored row is returned untouched, `inserted=False`, and the caller
         learns that this delivery owes no new work. The insert and the read-back
         share one transaction, so the row handed back is the row that satisfies
         the key at the moment the claim was decided.
+
+        Raises ValueError — before touching the database — when `outcome` and
+        `policy_id` disagree about the delivery's level: `EVENT_LEVEL_OUTCOMES`
+        may not name a policy, every other outcome must. The database CHECK
+        enforces the same invariant; guarding here too keeps the refusal loud
+        and typed instead of a driver-shaped IntegrityError, and is what makes
+        the namespace derivation below unambiguous.
 
         Raises like any other store call if the database is unreachable — the
         never-raises contract belongs to the CLASSIFIERS (malformed input is an
@@ -165,6 +197,22 @@ class DeliveryLedger:
         swallowing it here would ack an event whose audit row was never
         written. The intake loop already turns the exception into a stopped
         pass with the position un-acked."""
+        if outcome in EVENT_LEVEL_OUTCOMES and policy_id is not None:
+            raise ValueError(
+                f"event-level outcome {outcome.value!r} must not name a policy "
+                f"(got policy_id={policy_id!r}) — ignored/quarantined are facts "
+                "about an event, not about a rule"
+            )
+        if outcome not in EVENT_LEVEL_OUTCOMES and policy_id is None:
+            raise ValueError(
+                f"policy-level outcome {outcome.value!r} must name the policy "
+                "that produced it"
+            )
+        # The guard above just made "names a policy" equivalent to "is a
+        # policy-level outcome", so the namespace derives from either; the
+        # policy id is the one the type system already distinguishes.
+        namespace = _EVENT_KEY_NAMESPACE if policy_id is None else _POLICY_KEY_NAMESPACE
+        dedup_key = namespace + dedup_key
         statement = (
             pg_insert(DeliveryLedgerRow)
             .values(
@@ -194,8 +242,9 @@ class DeliveryLedger:
             return LedgerWrite(record=_to_record(row), inserted=inserted)
 
     def get(self, tenant: str, dedup_key: str) -> LedgerRecord | None:
-        """The row holding `dedup_key` for `tenant`, or None. Rides the primary
-        key."""
+        """The row holding `dedup_key` for `tenant`, or None. Takes the STORED
+        (namespaced) key — the one `LedgerRecord.dedup_key` reports — and rides
+        the primary key."""
         with session_scope() as session:
             row = session.get(DeliveryLedgerRow, (tenant, dedup_key))
             return _to_record(row) if row is not None else None

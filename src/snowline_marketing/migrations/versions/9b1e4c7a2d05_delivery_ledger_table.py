@@ -67,9 +67,12 @@ def upgrade() -> None:
             "'quarantined', 'failed')",
             name="ck_delivery_ledger_outcome",
         ),
-        # Policy-level outcomes must name the rule that produced them.
+        # Both directions: policy-level outcomes must name the rule that
+        # produced them, and the event-level ones (no rule was involved) must
+        # NOT — an ignored row claiming a policy puts a rule's name on a
+        # decision it never made.
         sa.CheckConstraint(
-            "policy_id IS NOT NULL OR outcome IN ('ignored', 'quarantined')",
+            "(policy_id IS NULL) = (outcome IN ('ignored', 'quarantined'))",
             name="ck_delivery_ledger_policy_id",
         ),
         # A matched/created/deduplicated/failed row that cannot say WHICH
@@ -78,10 +81,11 @@ def upgrade() -> None:
             "policy_version_id IS NOT NULL OR outcome IN ('ignored', 'quarantined')",
             name="ck_delivery_ledger_policy_version_id",
         ),
-        # A `created` row with nothing to point at claims work exists that
-        # nobody can find.
+        # Both directions here too: a `created` row with nothing to point at
+        # claims work exists that nobody can find, and an item ref on any
+        # other outcome is work the audit trail cannot account for.
         sa.CheckConstraint(
-            "outcome <> 'created' OR created_item_ref IS NOT NULL",
+            "(created_item_ref IS NOT NULL) = (outcome = 'created')",
             name="ck_delivery_ledger_created_item_ref",
         ),
         # A rejection with no explanation is an operator staring at a refusal

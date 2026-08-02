@@ -8,12 +8,15 @@ What is pinned here is the write shape, because everything above it depends on
 exactly these properties: the first delivery of a key claims it, every later one
 finds it TAKEN AND UNCHANGED (so a row the minting layer already advanced to
 `created` survives a re-delivery), the same key under two tenants is two rows,
-and the constraints that keep an audit row answerable are the database's rather
-than every future writer's.
+the store — never the caller — namespaces every key ("p:"/"e:", which is what
+makes the engine's reserved event-level shapes unforgeable), and the
+constraints that keep an audit row answerable are the database's rather than
+every future writer's.
 """
 
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
 from conftest import TENANT
 
@@ -43,7 +46,9 @@ def _matched(ledger: DeliveryLedger, **overrides):
 def test_a_fresh_key_is_claimed(migrated_db):
     write = _matched(DeliveryLedger())
     assert write.inserted
-    assert write.record.dedup_key == KEY
+    # The record reports the STORED key: the caller's rendered key under the
+    # store's policy-level namespace.
+    assert write.record.dedup_key == f"p:{KEY}"
     assert write.record.outcome is DeliveryOutcome.matched
     assert write.record.policy_version_id == VERSION_ID
     assert write.record.created_item_ref is None
@@ -72,7 +77,8 @@ def test_a_repeat_delivery_never_overwrites_the_row(migrated_db):
         session.execute(
             sa.update(DeliveryLedgerRow)
             .where(
-                DeliveryLedgerRow.tenant == TENANT, DeliveryLedgerRow.dedup_key == KEY
+                DeliveryLedgerRow.tenant == TENANT,
+                DeliveryLedgerRow.dedup_key == f"p:{KEY}",
             )
             .values(
                 outcome=DeliveryOutcome.created.value, created_item_ref="pm-item-42"
@@ -120,12 +126,79 @@ def test_the_same_key_under_two_tenants_is_two_rows(migrated_db):
         policy_version_id="gv-other",
     )
     assert mine.inserted and theirs.inserted
-    assert ledger.get(TENANT, bare_key).policy_version_id == VERSION_ID
-    assert ledger.get("snowlinedev", bare_key).policy_version_id == "gv-other"
+    assert ledger.get(TENANT, f"p:{bare_key}").policy_version_id == VERSION_ID
+    assert ledger.get("snowlinedev", f"p:{bare_key}").policy_version_id == "gv-other"
 
 
 def test_get_misses_return_none(migrated_db):
     assert DeliveryLedger().get(TENANT, "never-written") is None
+
+
+def test_the_store_namespaces_policy_and_event_keys(migrated_db):
+    # The namespace is the STORE's, derived from whether the write names a
+    # policy — a caller renders keys but cannot choose which namespace they
+    # land in.
+    ledger = DeliveryLedger()
+    policy = _matched(ledger)
+    event = ledger.record(
+        tenant=TENANT,
+        dedup_key=f"{TENANT}:pm-evt-0000200:ignored",
+        event_id="pm-evt-0000200",
+        event_type="item_reopened",
+        outcome=DeliveryOutcome.ignored,
+        detail="no entry selects this event",
+    )
+    assert policy.record.dedup_key.startswith("p:")
+    assert event.record.dedup_key == f"e:{TENANT}:pm-evt-0000200:ignored"
+
+
+def test_a_forged_event_shape_cannot_reach_an_event_level_row(migrated_db):
+    # The unforgeability the namespace exists for: a tenant-authored template
+    # rendering the engine's reserved shape VERBATIM — even one that renders
+    # the "e:" prefix itself — is a policy-level write, lands under "p:", and
+    # neither collides with nor reads back the real event-level row.
+    ledger = DeliveryLedger()
+    reserved = f"{TENANT}:pm-evt-0000300:ignored"
+    event = ledger.record(
+        tenant=TENANT,
+        dedup_key=reserved,
+        event_id="pm-evt-0000300",
+        event_type="item_reopened",
+        outcome=DeliveryOutcome.ignored,
+        detail="the real event-level row",
+    )
+    for forged in (reserved, f"e:{reserved}"):
+        write = _matched(ledger, dedup_key=forged, event_id="pm-evt-0000300")
+        assert write.inserted  # a fresh row, not a read-back of the reserved one
+        assert write.record.dedup_key == f"p:{forged}"
+        assert write.record.outcome is DeliveryOutcome.matched
+    assert event.record.dedup_key == f"e:{reserved}"
+
+
+def test_record_refuses_an_event_level_outcome_naming_a_policy(migrated_db):
+    # The store-side half of the CHECK below: loud and typed, before the
+    # database gets a chance to answer with a driver-shaped IntegrityError.
+    with pytest.raises(ValueError, match="must not name a policy"):
+        DeliveryLedger().record(
+            tenant=TENANT,
+            dedup_key=f"{TENANT}:pm-evt-0000400:ignored",
+            policy_id="some-policy",
+            event_id="pm-evt-0000400",
+            event_type="item_reopened",
+            outcome=DeliveryOutcome.ignored,
+        )
+
+
+def test_record_refuses_a_policy_level_outcome_without_a_policy(migrated_db):
+    with pytest.raises(ValueError, match="must name the policy"):
+        DeliveryLedger().record(
+            tenant=TENANT,
+            dedup_key=f"{TENANT}:no-policy:pm-evt-0000401",
+            event_id="pm-evt-0000401",
+            event_type="item_completed",
+            outcome=DeliveryOutcome.matched,
+            policy_version_id=VERSION_ID,
+        )
 
 
 def test_for_event_answers_what_happened_to_one_event(migrated_db):
@@ -243,6 +316,35 @@ def test_a_created_row_must_point_at_the_item_it_created(migrated_db):
         policy_id="p",
         outcome=DeliveryOutcome.created.value,
         policy_version_id=VERSION_ID,
+    )
+
+
+def test_an_event_level_row_cannot_name_a_policy(migrated_db):
+    # The other direction of ck_delivery_ledger_policy_id: an ignored row
+    # claiming a policy puts a rule's name on a decision it never made.
+    _rejects(
+        dedup_key="ignored-with-policy",
+        policy_id="p",
+        outcome=DeliveryOutcome.ignored.value,
+    )
+    _rejects(
+        dedup_key="quarantined-with-policy",
+        policy_id="p",
+        outcome=DeliveryOutcome.quarantined.value,
+        detail="a quarantine that claims a rule decided it",
+    )
+
+
+def test_a_non_created_row_cannot_carry_an_item_ref(migrated_db):
+    # The other direction of ck_delivery_ledger_created_item_ref: an item ref
+    # on a row whose outcome never says `created` is work the audit trail
+    # cannot account for.
+    _rejects(
+        dedup_key="ref-without-created",
+        policy_id="p",
+        outcome=DeliveryOutcome.matched.value,
+        policy_version_id=VERSION_ID,
+        created_item_ref="pm-item-orphan",
     )
 
 
