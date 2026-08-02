@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import sqlalchemy as sa
 from conftest import EVENT_FIXTURES_DIR, POLICY_FIXTURES_DIR, TENANT
 
@@ -41,7 +42,10 @@ def test_report_counts_match_the_engine_acceptance_expectations():
     assert report.counts[DeliveryOutcome.ignored] == 5
     assert report.counts[DeliveryOutcome.quarantined] == 1
     assert DeliveryOutcome.deduplicated not in report.counts
-    assert len(report.would_mint) == 8
+    # 7, not 8: the artifact's `monthly-metrics-snapshot` policy is
+    # mode=dry_run — evaluated and visible per delivery, but the headline
+    # must not count a mint production would never perform.
+    assert len(report.would_mint) == 7
 
 
 def test_a_custom_version_id_is_recorded_and_reported():
@@ -61,22 +65,31 @@ def test_would_mint_carries_the_full_consequence_summary():
     assert messaging.consequence.value == "messaging_refresh"
     assert messaging.mode.value == "active"
     assert messaging.mints is True
-    assert messaging.destination_scope == "turtlesedge/marketing"
-    assert messaging.destination_initiative == "messaging"
-    assert messaging.destination_phase is None
+    assert messaging.destination.scope == "turtlesedge/marketing"
+    assert messaging.destination.initiative == "messaging"
+    assert messaging.destination.phase is None
     assert messaging.title_template
 
 
 def test_a_dry_run_mode_policy_is_reported_as_not_minting():
     # The shipped artifact's own `monthly-metrics-snapshot` policy is
-    # `mode: dry_run` — the preview must say so, distinct from an
-    # `approval_required` match, which IS owed work (spec §11 vs §12).
+    # `mode: dry_run` — visible per DELIVERY with its mints flag, but
+    # EXCLUDED from the would_mint headline: production would mint nothing
+    # for it, and the headline must not overstate a rollout. An
+    # `approval_required` match IS owed work and stays in (spec §11 vs §12).
     report = dry_run(TURTLESEDGE_BODY, EVENT_FIXTURES_DIR, tenant=TENANT)
+    per_delivery = [
+        d.would_mint
+        for event in report.events
+        for d in event.deliveries
+        if d.would_mint is not None
+    ]
     snapshot = next(
-        m for m in report.would_mint if m.policy_id == "monthly-metrics-snapshot"
+        m for m in per_delivery if m.policy_id == "monthly-metrics-snapshot"
     )
     assert snapshot.mode.value == "dry_run"
     assert snapshot.mints is False
+    assert all(m.policy_id != "monthly-metrics-snapshot" for m in report.would_mint)
     publish = next(
         m for m in report.would_mint if m.policy_id == "app-store-listing-publish"
     )
@@ -269,3 +282,52 @@ def test_render_text_reports_a_stall():
     text = render_text(report)
     assert "STALLED" in text
     assert "gv-prose" in text
+
+
+def test_a_broken_capture_is_a_failed_report_not_a_clean_empty_one(tmp_path):
+    # Mixed-width prefixes make fixture_files raise; run_intake records it as
+    # a while_reading failure — the report must surface it, or a broken
+    # capture reads as "this policy matches nothing".
+    (tmp_path / "100-a.json").write_text("{}")
+    (tmp_path / "0002-b.json").write_text("{}")
+    report = dry_run(TURTLESEDGE_BODY, tmp_path, tenant=TENANT)
+    assert not report.ok
+    assert report.pass_failure is not None
+    assert report.pass_failure.while_reading
+    assert "mix widths" in report.pass_failure.error
+    assert "FAILED" in render_text(report)
+
+
+def test_a_broken_draft_stalls_even_against_an_empty_capture(tmp_path):
+    # Eager classification: the pre-flight must never say "fine" about a
+    # draft that would stall production on its first real event, however
+    # empty the capture is.
+    report = dry_run("this is not json", tmp_path, tenant=TENANT)
+    assert not report.ok
+    assert report.stalled is not None
+    assert "not_json" in report.stalled.detail
+
+
+def test_a_missing_fixtures_directory_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="does not exist"):
+        dry_run(TURTLESEDGE_BODY, tmp_path / "no-such-capture", tenant=TENANT)
+
+
+def test_an_unserializable_draft_mapping_stalls_instead_of_raising(tmp_path):
+    import datetime
+
+    report = dry_run(
+        {"schema_version": 1, "when": datetime.datetime(2026, 8, 1)},
+        tmp_path,
+        tenant=TENANT,
+    )
+    assert not report.ok
+    assert report.stalled is not None
+    assert "not-JSON-serializable" in report.stalled.detail or "not_json" in str(
+        report.stalled.detail
+    )
+
+
+def test_counts_are_derived_from_events():
+    report = dry_run(TURTLESEDGE_BODY, EVENT_FIXTURES_DIR, tenant=TENANT)
+    assert sum(report.counts.values()) == sum(len(e.deliveries) for e in report.events)

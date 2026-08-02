@@ -36,18 +36,23 @@ dashboard/CLI consumes; `render_text` is today's human-readable summary.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 from snowline_marketing.cursors import InMemoryCursorStore
-from snowline_marketing.engine import Delivery, EvaluationHandler, EvaluationStalled
+from snowline_marketing.engine import (
+    Delivery,
+    EvaluationHandler,
+    EvaluationStalled,
+    resolve_policy_set,
+)
 from snowline_marketing.events import MalformedEnvelope
-from snowline_marketing.intake import run_intake
+from snowline_marketing.intake import HandlerFailure, run_intake
 from snowline_marketing.ledger import DeliveryOutcome, InMemoryDeliveryLedger
-from snowline_marketing.policies import ConsequenceType, PolicyMode
+from snowline_marketing.policies import ConsequenceType, PolicyDestination, PolicyMode
 from snowline_marketing.policy_cache import InMemoryPolicyCache
 from snowline_marketing.policy_source import InMemoryPolicyProvider
 from snowline_marketing.sources import FixturesEventSource
@@ -77,7 +82,14 @@ def _decode_candidate_body(policy_body: str | bytes | Mapping[str, Any]) -> str:
     replacement characters land in a body that was already unparseable
     JSON."""
     if isinstance(policy_body, Mapping):
-        return json.dumps(dict(policy_body))
+        try:
+            return json.dumps(dict(policy_body))
+        except (TypeError, ValueError) as exc:
+            # A draft mapping holding a non-JSON value (a datetime, a set) is
+            # a BROKEN DRAFT, same class as undecodable bytes below — it must
+            # flow through to parse_policy_set and quarantine as not_json with
+            # a readable detail, never raise a traceback out of dry_run.
+            return f"<draft mapping is not JSON-serializable: {exc}>"
     if isinstance(policy_body, bytes):
         return policy_body.decode("utf-8", errors="replace")
     return policy_body
@@ -96,9 +108,9 @@ class WouldMintSummary:
     consequence: ConsequenceType
     mode: PolicyMode
     mints: bool
-    destination_scope: str
-    destination_initiative: str | None
-    destination_phase: str | None
+    # The frozen model, whole — a flattened field-per-scalar copy would
+    # silently drop any destination field a later schema adds.
+    destination: PolicyDestination
     title_template: str
 
 
@@ -111,9 +123,7 @@ def _would_mint(delivery: Delivery) -> WouldMintSummary | None:
         consequence=consequence.consequence,
         mode=consequence.mode,
         mints=consequence.mints,
-        destination_scope=consequence.destination.scope,
-        destination_initiative=consequence.destination.initiative,
-        destination_phase=consequence.destination.phase,
+        destination=consequence.destination,
         title_template=consequence.entry.title_template,
     )
 
@@ -164,36 +174,51 @@ class DryRunReport:
     `stalled` is set exactly when the CANDIDATE body itself could not be
     evaluated — malformed, or declaring a tenant other than the one being
     previewed — the same distinction `engine.EvaluationStalled` makes on the
-    live path, carried through so a broken draft is reported as broken
-    rather than evaluated against nothing (spec §6). When set, `events` and
-    `counts` are empty and `malformed` reports only fixtures classification
-    reached before the stall: nothing was evaluated, mirroring `evaluate`'s
-    "nothing is recorded and nothing is consumed" for a live stall."""
+    live path. The candidate is classified EAGERLY, before any fixture is
+    read, so a broken draft stalls even against an empty capture — the
+    pre-flight must never say "fine" about a draft that would stall
+    production on its first real event.
+
+    `pass_failure` is set when the CAPTURE walk itself failed (an invalid
+    fixtures directory, a mid-pass read error) — `run_intake`'s recorded
+    failure, surfaced instead of swallowed, so a broken capture is never
+    indistinguishable from "this policy matches nothing".
+
+    `ok` is True only when NEITHER is set: the whole capture was evaluated."""
 
     tenant: str
     version_id: str
     stalled: EvaluationStalled | None
+    pass_failure: HandlerFailure | None
     events: tuple[DryRunEventResult, ...]
     malformed: tuple[MalformedEnvelope, ...]
-    # A read-only view (`MappingProxyType`), same reasoning as
-    # `events.EventPayload.details`: this is a frozen dataclass, and a plain
-    # `dict` here would be the one hole a caller could mutate through after
-    # the fact.
-    counts: Mapping[DeliveryOutcome, int]
 
     @property
     def ok(self) -> bool:
-        return self.stalled is None
+        return self.stalled is None and self.pass_failure is None
+
+    @property
+    def counts(self) -> Mapping[DeliveryOutcome, int]:
+        """Delivery totals, DERIVED from `events` — stored state could
+        disagree with the per-event lines it summarizes; a property cannot."""
+        return Counter(
+            delivery.outcome for event in self.events for delivery in event.deliveries
+        )
 
     @property
     def would_mint(self) -> tuple[WouldMintSummary, ...]:
-        """Every consequence this preview says would have minted, in delivery
-        order — the report's direct answer to §11's headline question."""
+        """Every consequence this preview says WOULD ACTUALLY MINT, in
+        delivery order — the report's direct answer to §11's headline
+        question. Filtered on `mints`: a `dry_run`-mode policy's consequence
+        is evaluated and reported per delivery, but production would mint
+        nothing for it, and this headline must not overstate what a rollout
+        does. The per-delivery `would_mint` summaries keep every consequence,
+        mints flag visible, for the operator reading line by line."""
         return tuple(
             delivery.would_mint
             for event in self.events
             for delivery in event.deliveries
-            if delivery.would_mint is not None
+            if delivery.would_mint is not None and delivery.would_mint.mints
         )
 
 
@@ -218,55 +243,75 @@ def dry_run(
     `EvaluationHandler` and `run_intake` — see the module docstring), pointed
     at three in-memory stores instead of the real ones: `InMemoryPolicyCache`,
     `InMemoryDeliveryLedger`, `InMemoryCursorStore`. Nothing durable is
-    touched."""
+    touched.
+
+    Raises ValueError when `fixtures_dir` does not exist: a glob over a
+    typo'd path yields nothing, and a clean "0 deliveries" report over a
+    capture that was never read would be indistinguishable from a genuinely
+    empty one — the wrong-path case must fail loudly, matching
+    `sources.fixture_files`' posture toward broken captures."""
+    directory = Path(fixtures_dir)
+    if not directory.is_dir():
+        raise ValueError(
+            f"fixtures directory {str(directory)!r} does not exist — refusing "
+            "to report a never-read capture as an empty one"
+        )
+
     provider = InMemoryPolicyProvider()
     provider.put(tenant, version_id, _decode_candidate_body(policy_body))
+    cache = InMemoryPolicyCache()
+
+    # Classify the candidate EAGERLY, before any fixture is read — through the
+    # same call the handler makes. Lazily, an empty or all-malformed capture
+    # would never invoke the handler, never classify the draft, and report
+    # ok=True about a body that stalls production on its first real event.
+    resolution = resolve_policy_set(tenant, provider=provider, cache=cache)
+    if isinstance(resolution, EvaluationStalled):
+        return DryRunReport(
+            tenant=tenant,
+            version_id=version_id,
+            stalled=resolution,
+            pass_failure=None,
+            events=(),
+            malformed=(),
+        )
+
     ledger = InMemoryDeliveryLedger()
     handler = EvaluationHandler(
         tenant,
         provider=provider,
-        cache=InMemoryPolicyCache(),
+        cache=cache,
         ledger=ledger,
     )
     malformed: list[MalformedEnvelope] = []
-    run_intake(
-        FixturesEventSource(fixtures_dir),
+    result = run_intake(
+        FixturesEventSource(directory),
         handler,
         cursor_store=InMemoryCursorStore(),
         on_malformed=malformed.append,
     )
-    if handler.stall is not None:
-        # The candidate itself quarantines (or governance-shaped resolution
-        # failed, unreachable here since `InMemoryPolicyProvider` always
-        # resolves the tenant it was `put` for) — nothing ran past the first
-        # event, mirroring a live stall's "nothing is recorded, nothing is
-        # consumed".
-        return DryRunReport(
-            tenant=tenant,
-            version_id=version_id,
-            stalled=handler.stall,
-            events=(),
-            malformed=tuple(malformed),
-            counts=MappingProxyType({}),
-        )
     events = tuple(
         DryRunEventResult(
-            event_id=result.envelope.event_id,
-            event_type=result.envelope.event_type.value,
-            deliveries=tuple(_delivery_report(d) for d in result.deliveries),
+            event_id=evaluated.envelope.event_id,
+            event_type=evaluated.envelope.event_type.value,
+            deliveries=tuple(_delivery_report(d) for d in evaluated.deliveries),
         )
-        for result in handler.results
+        for evaluated in handler.results
     )
-    counts: dict[DeliveryOutcome, int] = {}
-    for delivery in handler.deliveries:
-        counts[delivery.outcome] = counts.get(delivery.outcome, 0) + 1
     return DryRunReport(
         tenant=tenant,
         version_id=version_id,
-        stalled=None,
+        # The handler's stall would also surface as result.failure; check it
+        # first so a stall reports as a stall, not a generic pass failure.
+        # (Eager classification makes a candidate stall here unreachable in
+        # practice, but the handler seam keeps its own contract.)
+        stalled=handler.stall,
+        # The capture walk's own failure — a mixed-width capture, a file
+        # deleted mid-pass — surfaced, never swallowed: a broken capture must
+        # not read as "this policy matches nothing".
+        pass_failure=None if handler.stall is not None else result.failure,
         events=events,
         malformed=tuple(malformed),
-        counts=MappingProxyType(counts),
     )
 
 
@@ -282,6 +327,14 @@ def render_text(report: DryRunReport) -> str:
         stall = report.stalled
         lines.append(f"STALLED ({stall.reason.value}): {stall.detail}")
         return "\n".join(lines)
+    if report.pass_failure is not None:
+        failure = report.pass_failure
+        where = failure.position or "<pass>"
+        lines.append(f"FAILED at {where}: {failure.error}")
+        lines.append(
+            "capture walk did not complete — results below (if any) cover "
+            "only what was read before the failure"
+        )
 
     total = sum(report.counts.values())
     lines.append(f"{total} deliveries evaluated:")
@@ -310,11 +363,11 @@ def render_text(report: DryRunReport) -> str:
             lines.append(head)
             wm = delivery.would_mint
             if wm is not None:
-                destination = wm.destination_scope
-                if wm.destination_initiative:
-                    destination += f"/{wm.destination_initiative}"
-                if wm.destination_phase:
-                    destination += f"/{wm.destination_phase}"
+                destination = wm.destination.scope
+                if wm.destination.initiative:
+                    destination += f"/{wm.destination.initiative}"
+                if wm.destination.phase:
+                    destination += f"/{wm.destination.phase}"
                 lines.append(
                     f"      would mint: {wm.consequence.value} "
                     f"(mode={wm.mode.value}, mints={wm.mints}) -> {destination} "
