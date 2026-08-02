@@ -370,15 +370,93 @@ def test_the_default_dedup_template_is_the_spec_logical_key():
     "template",
     [
         "{tenant}:{policy_id}:{event_id}",
-        "{tenant}:{policy_id}:{milestone}",
-        "{policy_id}/{scope}/{initiative}/{phase}",
         "{tenant}:{policy_id}:{entity_kind}:{entity_id}",
-        "{consequence}:{event_type}:{work_kind}",
+        "{consequence}:{event_type}:{scope}",
     ],
 )
-def test_known_dedup_placeholders_are_accepted(template):
+def test_always_present_dedup_placeholders_are_accepted(template):
     parsed = parse_policy_set(_set(_entry("p1") | {"dedup_key_template": template}))
     assert isinstance(parsed, PolicySet), parsed
+
+
+@pytest.mark.parametrize(
+    "event_types,template",
+    [
+        (["milestone_released"], "{tenant}:{policy_id}:{milestone}"),
+        (["milestone_state_changed", "milestone_released"], "{policy_id}:{milestone}"),
+        (["initiative_phase_completed"], "{policy_id}/{scope}/{initiative}/{phase}"),
+    ],
+)
+def test_conditional_placeholders_accepted_when_every_selected_type_guarantees(
+    event_types, template
+):
+    entry = _entry("p1") | {"event_types": event_types, "dedup_key_template": template}
+    parsed = parse_policy_set(_set(entry))
+    assert isinstance(parsed, PolicySet), parsed
+
+
+@pytest.mark.parametrize(
+    "event_types,template,culprit",
+    [
+        # item_completed never guarantees an initiative — loose work has none.
+        (["item_completed"], "{tenant}:{policy_id}:{initiative}", "item_completed"),
+        # One guaranteed type does not rescue the other selected type.
+        (
+            ["milestone_released", "item_completed"],
+            "{policy_id}:{milestone}",
+            "item_completed",
+        ),
+    ],
+)
+def test_conditional_placeholder_without_guarantee_is_malformed(
+    event_types, template, culprit
+):
+    # Optional-but-absent renders the constant "None" key that swallows every
+    # later delivery — rejected at parse time, naming the offending type.
+    entry = _entry("p1") | {"event_types": event_types, "dedup_key_template": template}
+    parsed = parse_policy_set(_set(entry))
+    assert isinstance(parsed, MalformedPolicySet)
+    assert culprit in parsed.detail
+
+
+def test_work_kind_is_not_a_dedup_placeholder():
+    # No event type guarantees work_kind, so it is out of the vocabulary
+    # entirely rather than a trap that validates and renders "None".
+    parsed = parse_policy_set(
+        _set(_entry("p1") | {"dedup_key_template": "{policy_id}:{work_kind}"})
+    )
+    assert isinstance(parsed, MalformedPolicySet)
+    assert "'work_kind'" in parsed.detail
+
+
+@pytest.mark.parametrize(
+    "template,fragment",
+    [
+        # A nested placeholder hides in the format spec where Formatter().parse
+        # does not surface it as a field — it would KeyError per matched event.
+        ("{tenant}:{policy_id}:{event_id:{pad}}", "nested"),
+        # str.format accepts only !s/!r/!a; anything else raises at mint time.
+        ("{tenant!q}:{policy_id}:{event_id}", "conversion"),
+    ],
+)
+def test_deferred_crash_template_forms_are_malformed(template, fragment):
+    parsed = parse_policy_set(_set(_entry("p1") | {"dedup_key_template": template}))
+    assert isinstance(parsed, MalformedPolicySet)
+    assert fragment in parsed.detail
+
+
+def test_tenant_mismatch_quarantines():
+    # A structurally valid set resolved FOR tenant A but declaring tenant B is
+    # a misregistered artifact — quarantined, never cached or evaluated as A's.
+    parsed = parse_policy_set(
+        _set(_entry("p1")), expected_tenant="someone-else", version_id="v-9"
+    )
+    assert isinstance(parsed, MalformedPolicySet)
+    assert parsed.reason is MalformedPolicyReason.tenant_mismatch
+    assert "someone-else" in parsed.detail
+    assert parsed.version_id == "v-9"
+    # The declared tenant is carried, so the quarantine surface names it.
+    assert parsed.tenant == "turtlesedge"
 
 
 def test_an_unknown_dedup_placeholder_is_malformed():

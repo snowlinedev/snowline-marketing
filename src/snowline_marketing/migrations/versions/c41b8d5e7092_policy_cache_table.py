@@ -59,8 +59,10 @@ def upgrade() -> None:
         # enforced by the database rather than by every future writer
         # remembering.
         sa.CheckConstraint(
-            "(parse_outcome = 'valid' AND quarantine_reason IS NULL) "
-            "OR (parse_outcome = 'quarantined' AND quarantine_reason IS NOT NULL)",
+            "(parse_outcome = 'valid' AND quarantine_reason IS NULL "
+            "AND quarantine_detail IS NULL) "
+            "OR (parse_outcome = 'quarantined' AND quarantine_reason IS "
+            "NOT NULL AND quarantine_detail IS NOT NULL)",
             name="ck_policy_cache_quarantine_reason",
         ),
     )

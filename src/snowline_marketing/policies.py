@@ -79,9 +79,7 @@ Constraints this module encodes, and why:
 from __future__ import annotations
 
 import enum
-import json
 import string
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -93,7 +91,8 @@ from pydantic import (
     model_validator,
 )
 
-from snowline_marketing.events import EventType
+from snowline_marketing import classify
+from snowline_marketing.events import EventType, guaranteed_payload_fields
 
 # The policy-set body's own version, independent of the envelope's. Bumped only
 # when the POLICY shape changes incompatibly; a body declaring any other
@@ -121,9 +120,13 @@ DEFAULT_DEDUP_KEY_TEMPLATE = "{tenant}:{policy_id}:{event_id}"
 # envelope's predicate surface (`events.EventPayload`) and its subject ref.
 # CLOSED on purpose — this is the contract the evaluation engine implements,
 # and a placeholder outside it cannot be filled from an envelope. Note what is
-# absent: `payload.details` is unschema'd free-form data (see `events.py`), so
-# a dedup key can never depend on a field no producer guarantees.
-DEDUP_KEY_FIELDS = frozenset(
+# absent: `payload.details` is unschema'd free-form data (see `events.py`),
+# and `work_kind`, which NO event type guarantees — a dedup key can never
+# depend on a field no producer guarantees.
+#
+# ALWAYS: renderable for every event type — the delivery identity, the
+# envelope's required fields, the subject ref, the policy's own consequence.
+DEDUP_KEY_FIELDS_ALWAYS = frozenset(
     {
         "tenant",
         "policy_id",
@@ -132,13 +135,17 @@ DEDUP_KEY_FIELDS = frozenset(
         "entity_kind",
         "entity_id",
         "scope",
-        "initiative",
-        "phase",
-        "milestone",
-        "work_kind",
         "consequence",
     }
 )
+# CONDITIONAL: Optional on `events.EventPayload`, guaranteed only for the
+# event types whose validation requires them (`events.guaranteed_payload_
+# fields`). An entry may reference one ONLY when every event type it selects
+# guarantees it — otherwise the template validates and then renders the
+# constant "None" key that silently swallows every later delivery, the exact
+# failure parse-time validation exists to catch.
+DEDUP_KEY_FIELDS_CONDITIONAL = frozenset({"initiative", "phase", "milestone"})
+DEDUP_KEY_FIELDS = DEDUP_KEY_FIELDS_ALWAYS | DEDUP_KEY_FIELDS_CONDITIONAL
 
 
 class ConsequenceType(enum.StrEnum):
@@ -298,14 +305,19 @@ class PolicyEntry(_Model):
                 "run in mode 'active' — publishing is approval-gated (spec §12); "
                 "use 'approval_required' or 'dry_run'"
             )
-        _validate_dedup_template(self.policy_id, self.dedup_key_template)
+        _validate_dedup_template(
+            self.policy_id, self.dedup_key_template, self.event_types
+        )
         return self
 
 
-def _validate_dedup_template(policy_id: str, template: str) -> None:
-    """Reject a dedup-key template the engine could not render (see the module
-    docstring). Raises ValueError — called from inside model validation, so it
-    surfaces through the same never-raises classification as everything else."""
+def _validate_dedup_template(
+    policy_id: str, template: str, event_types: tuple[EventType, ...]
+) -> None:
+    """Reject a dedup-key template the engine could not render — or could only
+    render into the constant/crashing keys the module docstring describes.
+    Raises ValueError — called from inside model validation, so it surfaces
+    through the same never-raises classification as everything else."""
     try:
         parsed = list(string.Formatter().parse(template))
     except ValueError as exc:
@@ -315,7 +327,28 @@ def _validate_dedup_template(policy_id: str, template: str) -> None:
             f"policy {policy_id!r}: dedup_key_template is not a valid format "
             f"string ({exc})"
         ) from exc
-    fields = [field for _, field, _, _ in parsed if field is not None]
+    fields: list[str] = []
+    for _, field, format_spec, conversion in parsed:
+        if field is None:
+            continue
+        if format_spec and "{" in format_spec:
+            # A nested placeholder hides inside the format spec, where
+            # Formatter().parse does not surface it as a field — str.format
+            # would KeyError per event at mint time, a policy that fails only
+            # on the events it matches.
+            raise ValueError(
+                f"policy {policy_id!r}: dedup_key_template uses a nested "
+                f"placeholder in a format spec ({format_spec!r}) — not "
+                "renderable from an envelope"
+            )
+        if conversion is not None and conversion not in ("s", "r", "a"):
+            # `str.format` accepts only !s/!r/!a and raises on anything else —
+            # at mint time, per matched event, unless rejected here.
+            raise ValueError(
+                f"policy {policy_id!r}: dedup_key_template uses unknown "
+                f"conversion {conversion!r} (only !s, !r, !a exist)"
+            )
+        fields.append(field)
     if not fields:
         raise ValueError(
             f"policy {policy_id!r}: dedup_key_template {template!r} references no "
@@ -332,6 +365,19 @@ def _validate_dedup_template(policy_id: str, template: str) -> None:
             f"placeholder(s) {', '.join(repr(u) for u in unknown)} — known "
             f"placeholders are {', '.join(sorted(DEDUP_KEY_FIELDS))}"
         )
+    # A conditional placeholder must be GUARANTEED by every event type this
+    # entry selects — Optional-but-absent renders the constant "None" key.
+    for field in sorted(set(fields) & DEDUP_KEY_FIELDS_CONDITIONAL):
+        lacking = sorted(
+            et.value for et in event_types if field not in guaranteed_payload_fields(et)
+        )
+        if lacking:
+            raise ValueError(
+                f"policy {policy_id!r}: dedup_key_template references "
+                f"{field!r}, which event type(s) {', '.join(lacking)} do not "
+                "guarantee — an absent value would render a constant 'None' "
+                "key and swallow every later delivery as a duplicate"
+            )
 
 
 class PolicySet(_Model):
@@ -402,6 +448,11 @@ class MalformedPolicyReason(enum.StrEnum):
     # A JSON object that does not satisfy the policy-set contract — including
     # duplicate policy ids, unknown event selectors and unknown consequences.
     invalid_policy_set = "invalid_policy_set"
+    # A structurally valid set whose declared tenant is not the tenant it was
+    # resolved FOR. Quarantined, not evaluated: caching or evaluating it would
+    # attribute one tenant's rules to another's audit trail — the cross-tenant
+    # misrepresentation §3/§14 forbid.
+    tenant_mismatch = "tenant_mismatch"
 
 
 @dataclass(frozen=True)
@@ -441,84 +492,40 @@ MalformedPolicySet.__hash__ = None  # type: ignore[assignment]
 # What a caller gets back for one policy body: understood, or explained.
 ParsedPolicySet = PolicySet | MalformedPolicySet
 
-# Same cap as `events._compact_errors`: an `extra="forbid"` violation across a
-# large policy set can produce one error per stray field, and the detail is
-# read in a table cell.
-_MAX_REPORTED_ERRORS = 5
-
-# How much of an offending value to quote. Long enough to recognize a typo'd
-# slug, short enough to stay in a table cell.
-_MAX_QUOTED_INPUT = 60
-
-
-def _quote_input(err: dict[str, Any]) -> str:
-    """The offending VALUE, when quoting it helps.
-
-    This is where policy errors deliberately say more than `events.py`'s
-    otherwise-identical helper. An event body is machine-produced, so the
-    field path is enough for the developer who reads it; a policy body is
-    HAND-AUTHORED in a governance artifact, and the operator's question is
-    "which of my values is wrong?" — `policies.0.event_types.1` plus the list
-    of legal values still leaves them scanning for the typo.
-
-    Only SCALARS are quoted. A missing-field or extra-field error reports the
-    whole surrounding entry as its input, and pasting an entire policy entry
-    into a table cell would bury the message it is attached to."""
-    if "input" not in err:
-        return ""
-    value = err["input"]
-    if not isinstance(value, (str, int, float, bool)) and value is not None:
-        return ""
-    text = repr(value)
-    if len(text) > _MAX_QUOTED_INPUT:
-        text = text[: _MAX_QUOTED_INPUT - 3] + "..."
-    return f" (got {text})"
-
-
-def _compact_errors(exc: ValidationError) -> str:
-    errors = exc.errors()
-    parts = [
-        f"{'.'.join(str(p) for p in err['loc']) or '<root>'}: {err['msg']}"
-        f"{_quote_input(err)}"
-        for err in errors[:_MAX_REPORTED_ERRORS]
-    ]
-    if len(errors) > _MAX_REPORTED_ERRORS:
-        parts.append(f"(+{len(errors) - _MAX_REPORTED_ERRORS} more)")
-    return "; ".join(parts)
-
 
 def parse_policy_set(
     raw: object,
     *,
     ref: str | None = None,
     version_id: str | None = None,
+    expected_tenant: str | None = None,
 ) -> ParsedPolicySet:
     """Classify one policy artifact body as a valid policy set or a
     quarantined one.
 
     Accepts JSON text/bytes (the governance artifact body, and the fixture
     files on disk — deliberately undecoded, so "not JSON" classifies here
-    instead of raising in the caller) or an already-decoded mapping.
+    instead of raising in the caller) or an already-decoded mapping. The
+    decode/validate skeleton is `classify.py`, shared with `parse_envelope`;
+    policy errors additionally quote offending scalars, because a policy body
+    is hand-authored and the operator's question is "which of my values is
+    wrong?".
+
+    `expected_tenant` is the tenant the body was resolved FOR. When given, a
+    structurally valid set declaring a DIFFERENT tenant quarantines as
+    `tenant_mismatch` — a misregistered artifact must never let one tenant's
+    rules cache, evaluate, or audit under another's name (§3/§14).
 
     Never raises. `ref` and `version_id` are locators the caller knows and
     this function only carries through, so a `MalformedPolicySet` is
     self-contained for the cache row that persists it."""
-    body: object = raw
-    if isinstance(body, (str, bytes, bytearray)):
-        try:
-            body = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            return MalformedPolicySet(
-                reason=MalformedPolicyReason.not_json,
-                detail=str(exc),
-                raw=raw,
-                ref=ref,
-                version_id=version_id,
-            )
-    if not isinstance(body, Mapping):
+    body, decode_failure = classify.decode_json_object(raw)
+    if decode_failure is not None:
+        failure, detail = decode_failure
         return MalformedPolicySet(
-            reason=MalformedPolicyReason.not_an_object,
-            detail=f"expected a JSON object, got {type(body).__name__}",
+            # By-value mapping: DecodeFailure's values are this enum's values.
+            reason=MalformedPolicyReason(failure.value),
+            detail=detail,
             raw=raw,
             ref=ref,
             version_id=version_id,
@@ -526,16 +533,29 @@ def parse_policy_set(
     # Best-effort tenant BEFORE validation: the quarantine surface's first
     # question is whose policy broke, and that answer usually survives whatever
     # else is wrong with the body.
-    candidate = body.get("tenant")
-    tenant = candidate.strip() or None if isinstance(candidate, str) else None
+    tenant = classify.best_effort_str(body, "tenant")
     try:
-        return PolicySet.model_validate(dict(body))
+        parsed = PolicySet.model_validate(dict(body))
     except ValidationError as exc:
         return MalformedPolicySet(
             reason=MalformedPolicyReason.invalid_policy_set,
-            detail=_compact_errors(exc),
+            detail=classify.compact_errors(exc, quote_scalars=True),
             raw=raw,
             ref=ref,
             version_id=version_id,
             tenant=tenant,
         )
+    if expected_tenant is not None and parsed.tenant != expected_tenant:
+        return MalformedPolicySet(
+            reason=MalformedPolicyReason.tenant_mismatch,
+            detail=(
+                f"body declares tenant {parsed.tenant!r} but was resolved for "
+                f"tenant {expected_tenant!r} — a misregistered artifact; not "
+                "cached as valid, not evaluated"
+            ),
+            raw=raw,
+            ref=ref,
+            version_id=version_id,
+            tenant=parsed.tenant,
+        )
+    return parsed

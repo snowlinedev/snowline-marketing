@@ -22,18 +22,22 @@ from snowline_marketing.policies import (
     MalformedPolicyReason,
     MalformedPolicySet,
     PolicySet,
-    parse_policy_set,
 )
 from snowline_marketing.policy_cache import ParseOutcome, PolicyCache
+from snowline_marketing.policy_source import ResolvedPolicySet
 
 VALID_BODY = (POLICY_FIXTURES_DIR / "turtlesedge.json").read_text()
 PROSE_BODY = (POLICY_FIXTURES_DIR / "malformed-not-json.json").read_text()
 VERSION_ID = "gv-7f3a91c4"
 
 
+def _resolved(version_id: str, body: str, tenant: str = TENANT) -> ResolvedPolicySet:
+    return ResolvedPolicySet(tenant=tenant, version_id=version_id, body=body)
+
+
 def _store(version_id: str, body: str, tenant: str = TENANT) -> PolicyCache:
     cache = PolicyCache()
-    cache.put(version_id, tenant, body, parse_policy_set(body, version_id=version_id))
+    cache.put(_resolved(version_id, body, tenant))
     return cache
 
 
@@ -135,8 +139,8 @@ def test_re_classification_clears_a_stale_quarantine_reason(migrated_db):
     # upsert overwrites every column rather than only some: a leftover reason
     # would make a healthy policy read as broken on the operator surface.
     cache = PolicyCache()
-    cache.put(VERSION_ID, TENANT, PROSE_BODY, parse_policy_set(PROSE_BODY))
-    cache.put(VERSION_ID, TENANT, VALID_BODY, parse_policy_set(VALID_BODY))
+    cache.put(_resolved(VERSION_ID, PROSE_BODY))
+    cache.put(_resolved(VERSION_ID, VALID_BODY))
     row = cache.get(VERSION_ID)
     assert row is not None
     assert row.outcome is ParseOutcome.valid
@@ -157,9 +161,15 @@ def test_versions_do_not_share_a_row(migrated_db):
 
 
 def test_tenants_are_listed_independently(migrated_db):
+    import json
+
     _store("gv-0001", VALID_BODY, tenant=TENANT)
     _store("gv-0002", PROSE_BODY, tenant=TENANT)
-    _store("gv-0003", VALID_BODY, tenant="snowlinedev")
+    # A genuinely-valid body FOR the second tenant — the same body under a
+    # different tenant would (correctly) quarantine as tenant_mismatch.
+    other = json.loads(VALID_BODY)
+    other["tenant"] = "snowlinedev"
+    _store("gv-0003", json.dumps(other), tenant="snowlinedev")
     cache = PolicyCache()
     assert {r.version_id for r in cache.list_for_tenant(TENANT)} == {
         "gv-0001",
@@ -209,4 +219,55 @@ def test_a_valid_row_cannot_carry_a_reason(migrated_db):
             raise AssertionError(
                 "ck_policy_cache_quarantine_reason did not reject a valid row "
                 "carrying a quarantine reason"
+            )
+
+
+def test_put_returns_the_classification(migrated_db):
+    # put owns parsing (tenant cross-checked) and hands the result back — the
+    # caller evaluates exactly what the row records, by construction.
+    cache = PolicyCache()
+    valid = cache.put(_resolved(VERSION_ID, VALID_BODY))
+    assert isinstance(valid, PolicySet)
+    quarantined = cache.put(_resolved("gv-prose", PROSE_BODY))
+    assert isinstance(quarantined, MalformedPolicySet)
+
+
+def test_a_tenant_mismatched_body_quarantines(migrated_db):
+    # VALID_BODY declares turtlesedge; resolving it FOR another tenant is a
+    # misregistered artifact — quarantined under the REQUESTED tenant, so the
+    # operator listing for that tenant shows the problem, and one tenant's
+    # rules never cache as another's valid policy.
+    cache = PolicyCache()
+    parsed = cache.put(_resolved("gv-cross", VALID_BODY, tenant="snowlinedev"))
+    assert isinstance(parsed, MalformedPolicySet)
+    assert parsed.reason is MalformedPolicyReason.tenant_mismatch
+    row = cache.get("gv-cross")
+    assert row is not None
+    assert row.tenant == "snowlinedev"
+    assert row.outcome is ParseOutcome.quarantined
+    assert row.quarantine_reason == MalformedPolicyReason.tenant_mismatch.value
+    assert {r.version_id for r in cache.list_for_tenant("snowlinedev")} == {"gv-cross"}
+
+
+def test_a_quarantined_row_needs_a_detail_too(migrated_db):
+    # The CHECK enforces the whole pairing, not just the reason column — a
+    # quarantined row whose detail is missing gives the operator a verdict
+    # with nothing to fix.
+    with session_scope() as session:
+        statement = sa.insert(CachedPolicySetRow).values(
+            version_id="gv-bad-write-3",
+            tenant=TENANT,
+            body=PROSE_BODY,
+            parse_outcome=ParseOutcome.quarantined.value,
+            quarantine_reason="not_json",
+            quarantine_detail=None,
+        )
+        try:
+            session.execute(statement)
+        except sa.exc.IntegrityError:
+            pass
+        else:
+            raise AssertionError(
+                "ck_policy_cache_quarantine_reason did not reject a quarantined "
+                "row with no detail"
             )

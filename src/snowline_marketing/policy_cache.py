@@ -53,6 +53,7 @@ from snowline_marketing.policies import (
     ParsedPolicySet,
     parse_policy_set,
 )
+from snowline_marketing.policy_source import ResolvedPolicySet
 
 
 class ParseOutcome(enum.StrEnum):
@@ -98,21 +99,30 @@ class PolicyCache:
     One method to write, two to read. `put` is a single-statement Postgres
     upsert for the same reason the cursor store's ack is — the first fetch of a
     version and every later one take one code path — but unguarded (see the
-    module docstring)."""
+    module docstring). `put` also OWNS classification: it parses the resolved
+    body itself (tenant cross-checked) and returns the result, so no caller
+    can persist a classification derived from a different body."""
 
-    def put(
-        self,
-        version_id: str,
-        tenant: str,
-        body: str,
-        parsed: ParsedPolicySet,
-    ) -> None:
-        """Cache one resolved version, classified.
+    def put(self, resolved: ResolvedPolicySet) -> ParsedPolicySet:
+        """Cache one resolved version, classifying it HERE.
 
-        `parsed` is the result of `parse_policy_set(body, version_id=...)` —
-        passed in rather than computed here so the caller keeps the parsed
-        model it is about to evaluate, and the row can never disagree with the
-        object in the caller's hand."""
+        Takes the `ResolvedPolicySet` straight from the provider and runs
+        `parse_policy_set` itself — with `expected_tenant` set from the
+        resolution, so a body declaring a different tenant quarantines as
+        `tenant_mismatch` instead of caching one tenant's rules under
+        another's name. Parsing inside `put` (and returning the result for
+        the caller to evaluate) is what makes the row's classification
+        UNABLE to disagree with its body: there is no API through which a
+        caller can hand in a parsed result derived from something else."""
+        version_id = resolved.version_id
+        tenant = resolved.tenant
+        body = resolved.body
+        parsed = parse_policy_set(
+            body,
+            ref=resolved.artifact_id,
+            version_id=version_id,
+            expected_tenant=tenant,
+        )
         if isinstance(parsed, MalformedPolicySet):
             outcome = ParseOutcome.quarantined
             reason: str | None = parsed.reason.value
@@ -152,6 +162,7 @@ class PolicyCache:
                     },
                 )
             )
+        return parsed
 
     def get(self, version_id: str) -> CachedPolicyVersion | None:
         """The cached version, or None when it was never fetched."""

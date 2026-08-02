@@ -70,8 +70,12 @@ log = logging.getLogger("snowline_marketing.policy_source")
 
 # ASSUMED (see module docstring): the governance read that answers "which
 # artifact version currently holds this tenant's marketing policy set, and what
-# is in it". One constant, one query parameter — the whole surface area of the
-# assumption.
+# is in it". One constant, one query parameter, plus ONE response-shape
+# requirement: the no-artifact answer must be a 404 whose JSON body names the
+# tenant it is answering for ({"tenant": ...}), because a bare framework 404
+# is indistinguishable from this route not existing at all — and that
+# ambiguity, misread as "no policies", would be a fleet-wide silent
+# match-none. That is the whole surface area of the assumption.
 POLICY_SET_PATH = "/marketing/policy-set"
 
 # VERIFIED: governance's `get_artifact_version` payload keys. `id` is the
@@ -227,10 +231,16 @@ class GatewayPolicyProvider:
         url = f"{self._governance_url}{POLICY_SET_PATH}"
         params = {"tenant": tenant}
         try:
-            if self._client is not None:
-                resp = self._client.get(url, params=params, timeout=self._timeout)
-            else:
-                resp = httpx.get(url, params=params, timeout=self._timeout)
+            if self._client is None:
+                # One long-lived client for the provider's lifetime, built
+                # lazily INSIDE the never-raises guard (construction can fail
+                # on a broken SSL_CERT_FILE). A one-shot httpx.get per tenant
+                # would re-handshake TCP on every sweep cycle — sustained
+                # connection churn against governance for no benefit. The
+                # provider is driven by the single-threaded policy sweep;
+                # nothing here is locked.
+                self._client = httpx.Client(timeout=self._timeout)
+            resp = self._client.get(url, params=params, timeout=self._timeout)
         except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
             # A typo'd MARKETING_GOVERNANCE_URL must land here as a typed
             # result, not escape the never-raises contract — and it takes all
@@ -248,10 +258,37 @@ class GatewayPolicyProvider:
                 detail=str(exc),
             )
         if resp.status_code == httpx.codes.NOT_FOUND:
+            # A 404 is AMBIGUOUS: "this tenant has no policy artifact" (an
+            # evaluable answer) and "this ROUTE does not exist on this
+            # governance build" (we learned nothing) share a status code — and
+            # the route is exactly the assumed, unverified part of this
+            # client. Conflating them converts a missing route into a fleet-
+            # wide silent match-none. So the route CONTRACT requires the
+            # no-artifact answer to identify itself: a JSON body naming the
+            # tenant it is answering for. A bare framework 404 (FastAPI's
+            # {"detail": "Not Found"}) is treated as unavailable — stall
+            # visibly, let the operator find the deployment problem.
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, Mapping) and payload.get("tenant") == tenant:
+                return PolicyResolutionError(
+                    tenant=tenant,
+                    failure=ResolutionFailure.not_found,
+                    detail=(
+                        f"governance has no policy-set artifact for tenant {tenant!r}"
+                    ),
+                    status_code=resp.status_code,
+                )
             return PolicyResolutionError(
                 tenant=tenant,
-                failure=ResolutionFailure.not_found,
-                detail=f"governance has no policy-set artifact for tenant {tenant!r}",
+                failure=ResolutionFailure.unavailable,
+                detail=(
+                    f"404 from {url} without a tenant-identifying body — "
+                    "indistinguishable from a missing route; NOT treated as "
+                    "'no policies'"
+                ),
                 status_code=resp.status_code,
             )
         if not resp.is_success:
@@ -293,18 +330,26 @@ def _read_version_payload(tenant: str, resp: httpx.Response) -> ResolutionResult
         )
     version_id = payload.get(_VERSION_ID_KEY)
     body = payload.get(_BODY_KEY)
-    missing = [
-        key
-        for key, value in ((_VERSION_ID_KEY, version_id), (_BODY_KEY, body))
-        if not isinstance(value, str) or not value.strip()
-    ]
-    if missing:
+    # The version id must be a real id — without it the ledger cannot record
+    # what was evaluated. The BODY need only be a string: an EMPTY body is an
+    # operator-authored artifact state (revised to nothing), and it must flow
+    # THROUGH resolution so the parser quarantines it against its version id —
+    # classifying it as a transport failure here would hide the broken version
+    # from the §11 quarantine listing and send the operator debugging a
+    # governance problem that does not exist.
+    if not isinstance(version_id, str) or not version_id.strip():
+        return PolicyResolutionError(
+            tenant=tenant,
+            failure=ResolutionFailure.malformed_response,
+            detail=f"policy-set payload is missing or empty at {_VERSION_ID_KEY!r}",
+            status_code=resp.status_code,
+        )
+    if not isinstance(body, str):
         return PolicyResolutionError(
             tenant=tenant,
             failure=ResolutionFailure.malformed_response,
             detail=(
-                "policy-set payload is missing or empty at "
-                f"{', '.join(repr(k) for k in missing)}"
+                f"policy-set payload is missing {_BODY_KEY!r} or it is not a string"
             ),
             status_code=resp.status_code,
         )

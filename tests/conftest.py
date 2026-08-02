@@ -140,42 +140,28 @@ def make_envelope(event_type, **overrides) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _cursor_rows_do_not_leak(request):
-    """Any DB-backed test leaves `consumer_cursors` EMPTY behind it. Cursor
-    rows key on source_key alone, and `FixturesEventSource`'s default key is
-    derived from the directory NAME — so a row leaked by one test silently
-    becomes another test's resume point, an execution-order-dependent flake in
-    exactly the isolation area this suite exists to nail down."""
+def _plugin_tables_do_not_leak(request):
+    """Any DB-backed test leaves EVERY plugin-owned table empty behind it.
+
+    Rows in these tables key on ids tests naturally reuse (a source_key, a
+    readable governance version id like 'pv-0001'), so a row leaked by one
+    test silently becomes another test's resume point or cache hit — an
+    execution-order-dependent flake in exactly the isolation area this suite
+    exists to nail down. Driven off `Base.metadata` (reverse dependency
+    order), so a new §4 table — delivery ledger, provenance ledger,
+    quarantine — is covered the day its model lands, instead of requiring a
+    per-table fixture copy someone forgets."""
     yield
     if "migrated_db" not in request.fixturenames:
         return
     import sqlalchemy as sa_
 
     from snowline_marketing.db import session_scope
-    from snowline_marketing.models import ConsumerCursor
+    from snowline_marketing.models import Base
 
     with session_scope() as session:
-        session.execute(sa_.delete(ConsumerCursor))
-
-
-@pytest.fixture(autouse=True)
-def _policy_cache_rows_do_not_leak(request):
-    """Any DB-backed test leaves `policy_cache` EMPTY behind it — the same
-    isolation rule as `_cursor_rows_do_not_leak`, for the same reason. Cache
-    rows key on a governance VERSION ID, and tests naturally reuse a handful of
-    readable ids ('pv-0001'); a row leaked by one test would silently become
-    another test's cache HIT, so a test asserting a fetch-and-store path would
-    pass while storing nothing."""
-    yield
-    if "migrated_db" not in request.fixturenames:
-        return
-    import sqlalchemy as sa_
-
-    from snowline_marketing.db import session_scope
-    from snowline_marketing.models import CachedPolicySet
-
-    with session_scope() as session:
-        session.execute(sa_.delete(CachedPolicySet))
+        for table in reversed(Base.metadata.sorted_tables):
+            session.execute(sa_.delete(table))
 
 
 @pytest.fixture(autouse=True)

@@ -132,14 +132,41 @@ def test_gateway_url_is_normalized():
     assert seen == [f"http://governance.example{POLICY_SET_PATH}?tenant={TENANT}"]
 
 
-def test_gateway_404_is_not_found_not_a_transport_problem():
+def test_gateway_tenant_identified_404_is_not_found():
+    # The no-artifact answer must IDENTIFY ITSELF (a JSON body naming the
+    # tenant) — that is part of the assumed route contract, because a bare
+    # 404 is indistinguishable from the route not existing at all.
     provider = GatewayPolicyProvider(
         "http://governance.example",
-        client=_client(lambda r: httpx.Response(404, json={"detail": "no artifact"})),
+        client=_client(lambda r: httpx.Response(404, json={"tenant": TENANT})),
     )
     result = provider.resolve(TENANT)
     assert isinstance(result, PolicyResolutionError)
     assert result.failure is ResolutionFailure.not_found
+    assert result.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        # FastAPI's framework 404 for an unknown route — the missing-route
+        # case this disambiguation exists for.
+        httpx.Response(404, json={"detail": "Not Found"}),
+        # A 404 that names a DIFFERENT tenant is answering some other question.
+        httpx.Response(404, json={"tenant": "someone-else"}),
+        # A non-JSON 404 (a proxy error page).
+        httpx.Response(404, text="<html>404</html>"),
+    ],
+)
+def test_a_bare_404_is_unavailable_not_no_policies(response):
+    # Misreading a missing ROUTE as "no policies" would be a fleet-wide
+    # silent match-none — the caller must stall visibly instead.
+    provider = GatewayPolicyProvider(
+        "http://governance.example", client=_client(lambda r: response)
+    )
+    result = provider.resolve(TENANT)
+    assert isinstance(result, PolicyResolutionError)
+    assert result.failure is ResolutionFailure.unavailable
     assert result.status_code == 404
 
 
@@ -257,3 +284,19 @@ def test_gateway_defaults_to_configured_governance_url(monkeypatch):
 
     GatewayPolicyProvider(client=_client(handler)).resolve(TENANT)
     assert seen == ["gov.example"]
+
+
+def test_an_empty_body_resolves_for_the_parser_to_quarantine():
+    # An operator-authored empty body is an artifact state, not a transport
+    # failure: it must flow through with its version id so the parser
+    # quarantines it and the §11 listing shows the broken version.
+    provider = GatewayPolicyProvider(
+        "http://governance.example",
+        client=_client(
+            lambda r: httpx.Response(200, json=_version_payload(body_snapshot=""))
+        ),
+    )
+    resolved = provider.resolve(TENANT)
+    assert isinstance(resolved, ResolvedPolicySet), resolved
+    assert resolved.body == ""
+    assert resolved.version_id == VERSION_ID
