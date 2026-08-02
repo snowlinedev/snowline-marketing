@@ -6,9 +6,10 @@ database URL is read when a session is actually opened — which lets tests
 point at a disposable database and avoids connecting just by importing the
 package.
 
-The only model so far is the intake `ConsumerCursor` (spec §4); the ledger,
-provenance and quarantine tables arrive with their own items. Everything here
-is model-agnostic — it owns connections, not schema.
+The models so far are the intake `ConsumerCursor`, the `CachedPolicySet` policy
+cache and the `DeliveryLedgerEntry` delivery ledger (spec §4); the provenance
+and quarantine tables arrive with their own items. Everything here is
+model-agnostic — it owns connections, not schema.
 """
 
 from __future__ import annotations

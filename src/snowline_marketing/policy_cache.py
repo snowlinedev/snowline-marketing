@@ -159,7 +159,7 @@ class PolicyCache:
             quarantine_detail=detail,
         )
         with session_scope() as session:
-            result = session.execute(
+            applied = session.execute(
                 statement.on_conflict_do_update(
                     index_elements=[CachedPolicySetRow.version_id],
                     set_={
@@ -180,8 +180,14 @@ class PolicyCache:
                     # rewrite another tenant's row.
                     where=CachedPolicySetRow.tenant == statement.excluded.tenant,
                 )
+                # RETURNING, not `rowcount`: under psycopg an upsert reports
+                # rowcount -1, so the `== 0` test this guard used to make was
+                # never true and the refusal below was silently unreachable. A
+                # suppressed conflict update returns NO row; an insert or an
+                # applied update returns one.
+                .returning(CachedPolicySetRow.version_id)
             )
-            if result.rowcount == 0:
+            if applied.first() is None:
                 # The conflict row belongs to ANOTHER tenant — refused, loudly.
                 # Only reachable with caller-chosen ids (dry-run/fixtures);
                 # governance ids are unique by construction.

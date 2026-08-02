@@ -11,7 +11,7 @@ source for PM's live outbox (snowline-pm #64) at cutover changes the
 **At-least-once, ack-after-handle.** The ack is the last thing that happens
 for an event, so a crash anywhere before it re-delivers that event on the next
 pass. That is the intended failure mode, not a leak: the delivery ledger
-(spec §4, a later item) keys on `tenant + policy_id + event_id` and makes a
+(spec §4, `ledger.py`) keys on `tenant + policy_id + event_id` and makes a
 re-delivered event converge to the same result. It is precisely because
 re-delivery is safe that this loop is allowed to be simple — it never tries to
 be exactly-once, and it never acks work it is not sure completed.

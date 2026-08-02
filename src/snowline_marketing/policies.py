@@ -6,8 +6,9 @@ org scope, revised through `revise_artifact` like any governed doc, so
 versioning, review and the decision trail come free. This module owns exactly
 one thing — the shape of that artifact's BODY. Where the body comes from and
 which version is current is `policy_source.py`'s job; what a parsed policy
-MATCHES is the evaluation engine's (a later item). Keeping the three apart is
-what lets the deterministic core be built and tested with no gateway in sight.
+MATCHES is `matching.py`'s, and what a match is owed is `engine.py`'s. Keeping
+them apart is what lets the deterministic core be built and tested with no
+gateway in sight.
 
 Constraints this module encodes, and why:
 

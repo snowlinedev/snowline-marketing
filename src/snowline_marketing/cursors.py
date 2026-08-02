@@ -80,8 +80,11 @@ class DbCursorStore:
     loop passes can overlap (a supervisor restart racing the old process), and
     the stale process acking its in-flight event AFTER the new process has
     moved on would rewind the cursor and re-deliver the whole span between
-    them — with the delivery ledger a later item, nothing dedups that yet. A
-    stale ack is instead a silent no-op, which is what it should be.
+    them. The delivery ledger (spec §4) makes that span converge rather than
+    duplicate, so it is no longer a correctness hole — but it is still an
+    arbitrary amount of the stream re-read and re-evaluated to reach the
+    conclusion "already done". A stale ack is instead a silent no-op, which is
+    what it should be.
 
     The `<` is pinned to `COLLATE "C"` (bytewise) on BOTH sides: the
     `EventSource` contract defines monotone as PYTHON string order — bytewise

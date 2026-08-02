@@ -279,6 +279,34 @@ def test_a_quarantined_row_needs_a_detail_too(migrated_db):
             )
 
 
+def test_a_cross_tenant_id_collision_is_refused_loudly(migrated_db, caplog):
+    # The refusal must be VISIBLE, not merely effective: a silently-unchanged
+    # row leaves an operator wondering why their dry-run's policy text is
+    # someone else's. (The guard originally tested `rowcount == 0`, which
+    # psycopg reports as -1 for an upsert — so the warning never fired.)
+    import json
+    import logging
+
+    cache = PolicyCache()
+    cache.put(_resolved("pv-collide", VALID_BODY, tenant=TENANT))
+    other = json.loads(VALID_BODY)
+    other["tenant"] = "snowlinedev"
+    with caplog.at_level(logging.WARNING, logger="snowline_marketing.policy_cache"):
+        cache.put(_resolved("pv-collide", json.dumps(other), tenant="snowlinedev"))
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_a_same_tenant_re_fetch_is_not_reported_as_refused(migrated_db, caplog):
+    # The other half: the ordinary steady state of every sweep must stay quiet.
+    import logging
+
+    cache = PolicyCache()
+    cache.put(_resolved(VERSION_ID, VALID_BODY))
+    with caplog.at_level(logging.WARNING, logger="snowline_marketing.policy_cache"):
+        cache.put(_resolved(VERSION_ID, VALID_BODY))
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
 def test_a_cross_tenant_id_collision_is_refused(migrated_db):
     # Version ids are caller-chosen on the dry-run/fixtures path, so two
     # tenants CAN reuse a readable id. The second put must not rewrite the
