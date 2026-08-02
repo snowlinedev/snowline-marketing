@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "tenant": "snowlinedev",
+  "policies": [
+    {
+      "policy_id": "messaging-refresh-on-marketing-impact",
+      "event_types": ["item_completed", "semantic_signal"],
+      "predicates": {
+        "scope": ["snowlinedev/*"],
+        "signals": ["marketing-impact"]
+      },
+      "consequence": "messaging_refresh",
+      "destination": {
+        "scope": "snowlinedev/marketing",
+        "initiative": "messaging"
+      },
+      "title_template": "Refresh Snowline messaging for {subject_title}",
+      "body_template": "{event_type} on {scope} carried a marketing-impact signal. Review the canonical messaging artifact and refresh what changed.",
+      "artifact_refs": ["b964d217"],
+      "deliverable_classes": ["positioning_copy"],
+      "human_owned": true
+    },
+    {
+      "policy_id": "release-announcement",
+      "event_types": ["milestone_released"],
+      "predicates": {
+        "scope": ["snowlinedev/*"],
+        "milestone": ["v*"]
+      },
+      "consequence": "announcement_preparation",
+      "destination": {
+        "scope": "snowlinedev/marketing",
+        "initiative": "announcements"
+      },
+      "title_template": "Prepare the {milestone} announcement",
+      "body_template": "Draft the release announcement for {milestone} from the canonical what's-new artifact.",
+      "channels": ["blog"],
+      "deliverable_classes": ["announcement_post"],
+      "dedup_key_template": "{tenant}:{policy_id}:{milestone}"
+    }
+  ]
+}

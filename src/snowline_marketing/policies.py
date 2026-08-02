@@ -6,8 +6,9 @@ org scope, revised through `revise_artifact` like any governed doc, so
 versioning, review and the decision trail come free. This module owns exactly
 one thing — the shape of that artifact's BODY. Where the body comes from and
 which version is current is `policy_source.py`'s job; what a parsed policy
-MATCHES is the evaluation engine's (a later item). Keeping the three apart is
-what lets the deterministic core be built and tested with no gateway in sight.
+MATCHES is `matching.py`'s, and what a match is owed is `engine.py`'s. Keeping
+them apart is what lets the deterministic core be built and tested with no
+gateway in sight.
 
 Constraints this module encodes, and why:
 
@@ -79,6 +80,7 @@ Constraints this module encodes, and why:
 from __future__ import annotations
 
 import enum
+import functools
 import string
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
@@ -315,23 +317,29 @@ class PolicyEntry(_Model):
         return self
 
 
-def _validate_dedup_template(
-    policy_id: str, template: str, event_types: tuple[EventType, ...]
-) -> None:
-    """Reject a dedup-key template the engine could not render — or could only
-    render into the constant/crashing keys the module docstring describes.
-    Raises ValueError — called from inside model validation, so it surfaces
-    through the same never-raises classification as everything else."""
+@functools.lru_cache
+def dedup_template_fields(template: str) -> frozenset[str]:
+    """The placeholder fields `template` references — THE parse of a dedup-key
+    template, shared by `_validate_dedup_template` and the engine's
+    `render_dedup_key` so the parse logic exists exactly once and the two ends
+    of the contract cannot drift apart.
+
+    Raises ValueError on the deferred-crash forms (unbalanced braces, nested
+    placeholders in a format spec, unknown conversions) — the validator wraps
+    the message with the owning policy id. The engine only calls this on
+    templates that already validated, so its hot path never raises — and,
+    lru_cached, never re-parses a template it has rendered before (one parse
+    per distinct template per process, against a vocabulary bounded by the
+    tenants' policy sets)."""
+    fields: set[str] = set()
     try:
         parsed = list(string.Formatter().parse(template))
     except ValueError as exc:
         # Unbalanced braces. `str.format` would raise this per event at mint
         # time instead — a policy that fails only on the events it matches.
         raise ValueError(
-            f"policy {policy_id!r}: dedup_key_template is not a valid format "
-            f"string ({exc})"
+            f"dedup_key_template is not a valid format string ({exc})"
         ) from exc
-    fields: list[str] = []
     for _, field, format_spec, conversion in parsed:
         if field is None:
             continue
@@ -341,25 +349,40 @@ def _validate_dedup_template(
             # would KeyError per event at mint time, a policy that fails only
             # on the events it matches.
             raise ValueError(
-                f"policy {policy_id!r}: dedup_key_template uses a nested "
-                f"placeholder in a format spec ({format_spec!r}) — not "
-                "renderable from an envelope"
+                f"dedup_key_template uses a nested placeholder in a format "
+                f"spec ({format_spec!r}) — not renderable from an envelope"
             )
         if conversion is not None and conversion not in ("s", "r", "a"):
             # `str.format` accepts only !s/!r/!a and raises on anything else —
             # at mint time, per matched event, unless rejected here.
             raise ValueError(
-                f"policy {policy_id!r}: dedup_key_template uses unknown "
-                f"conversion {conversion!r} (only !s, !r, !a exist)"
+                f"dedup_key_template uses unknown conversion {conversion!r} "
+                "(only !s, !r, !a exist)"
             )
-        fields.append(field)
+        fields.add(field)
+    return frozenset(fields)
+
+
+def _validate_dedup_template(
+    policy_id: str, template: str, event_types: tuple[EventType, ...]
+) -> None:
+    """Reject a dedup-key template the engine could not render — or could only
+    render into the constant/crashing keys the module docstring describes.
+    Raises ValueError — called from inside model validation, so it surfaces
+    through the same never-raises classification as everything else. The parse
+    itself lives in `dedup_template_fields` (shared with the engine's render);
+    this function owns the policy-level judgments about what it found."""
+    try:
+        fields = dedup_template_fields(template)
+    except ValueError as exc:
+        raise ValueError(f"policy {policy_id!r}: {exc}") from exc
     if not fields:
         raise ValueError(
             f"policy {policy_id!r}: dedup_key_template {template!r} references no "
             "placeholder — a constant dedup key collapses every delivery of this "
             "policy into the first one"
         )
-    unknown = sorted(set(fields) - DEDUP_KEY_FIELDS)
+    unknown = sorted(fields - DEDUP_KEY_FIELDS)
     if unknown:
         # Also catches `{0}`, `{a.b}` and `{a[0]}`: the parsed field name is
         # compared whole, so attribute/index access never resolves to a known
@@ -384,7 +407,7 @@ def _validate_dedup_template(
         ) from exc
     # A conditional placeholder must be GUARANTEED by every event type this
     # entry selects — Optional-but-absent renders the constant "None" key.
-    for field in sorted(set(fields) & DEDUP_KEY_FIELDS_CONDITIONAL):
+    for field in sorted(fields & DEDUP_KEY_FIELDS_CONDITIONAL):
         lacking = sorted(
             et.value for et in event_types if field not in guaranteed_payload_fields(et)
         )
@@ -438,6 +461,37 @@ class PolicySet(_Model):
             )
         return self
 
+    @model_validator(mode="after")
+    def _dedup_templates_cannot_collide(self) -> PolicySet:
+        # The duplicate-policy_id failure above, resurrected by another route:
+        # two entries whose IDENTICAL template omits {policy_id} render the
+        # IDENTICAL key for any envelope both select (same fields, same
+        # literals), so whenever their event_types overlap the same-key
+        # collision is GUARANTEED, not merely possible — the second policy's
+        # work would be swallowed as a duplicate of the first's, silently,
+        # forever. Identical templates WITH {policy_id} are safe (distinct ids
+        # render distinct keys), and the check deliberately stops at IDENTICAL
+        # template strings: non-identical templates differ in literals for the
+        # same envelope, so colliding takes equal field VALUES — a per-event
+        # fact no parse can see, and the engine's runtime guard owns it.
+        for index, first in enumerate(self.policies):
+            for second in self.policies[index + 1 :]:
+                if first.dedup_key_template != second.dedup_key_template:
+                    continue
+                if "policy_id" in dedup_template_fields(first.dedup_key_template):
+                    continue
+                if not set(first.event_types) & set(second.event_types):
+                    continue
+                raise ValueError(
+                    f"policies {first.policy_id!r} and {second.policy_id!r} "
+                    "select overlapping event types and share the "
+                    f"dedup_key_template {first.dedup_key_template!r}, which "
+                    "omits {policy_id} — every envelope both select would "
+                    "render the identical key, so one policy's work would be "
+                    "swallowed as a duplicate of the other's"
+                )
+        return self
+
     def entry(self, policy_id: str) -> PolicyEntry | None:
         """The entry with `policy_id`, or None. A ledger row records the
         policy id and the version id; this is how a reader gets from those two
@@ -455,7 +509,7 @@ class MalformedPolicyReason(enum.StrEnum):
     Coarse on purpose, like `events.MalformedReason`: the actionable specifics
     (which entry, which field) live in `MalformedPolicySet.detail`. The reason
     an operator acts on is "the version is quarantined", which is carried by
-    the RESULT TYPE, not by which of these three values it holds."""
+    the RESULT TYPE, not by which of these values it holds."""
 
     # The artifact body was not JSON at all (a policy artifact revised to prose
     # is the realistic case — governance stores bodies as text).
@@ -470,6 +524,12 @@ class MalformedPolicyReason(enum.StrEnum):
     # attribute one tenant's rules to another's audit trail — the cross-tenant
     # misrepresentation §3/§14 forbid.
     tenant_mismatch = "tenant_mismatch"
+    # The version id is already cached for a DIFFERENT tenant, so the cache
+    # refused the write (`policy_cache.put`'s tenant-guarded upsert). The
+    # version is unevaluable while the collision stands: a ledger row
+    # recording this id would join to the OTHER tenant's policy text, and an
+    # audit row that joins to the wrong rules is worse than a visible stall.
+    version_collision = "version_collision"
 
 
 # Import-time pin: `parse_policy_set` maps `classify.DecodeFailure` into this

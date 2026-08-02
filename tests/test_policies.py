@@ -24,6 +24,7 @@ from snowline_marketing.policies import (
     MalformedPolicySet,
     PolicyMode,
     PolicySet,
+    dedup_template_fields,
     parse_policy_set,
 )
 
@@ -546,6 +547,79 @@ def test_models_are_frozen():
     assert isinstance(parsed, PolicySet)
     with pytest.raises(Exception):
         parsed.policies[0].mode = PolicyMode.dry_run
+
+
+def test_identical_templates_without_policy_id_collide_at_parse_time():
+    # The duplicate-policy_id failure resurrected via templates: identical
+    # template strings that omit {policy_id}, on entries whose event types
+    # overlap, render the identical key for every envelope both select — a
+    # GUARANTEED collision, quarantined whole-version like any other malformed
+    # shape, naming both entries.
+    first = _entry("release-listing") | {
+        "event_types": ["milestone_released"],
+        "dedup_key_template": "{tenant}:{milestone}",
+    }
+    second = _entry("release-announcement") | {
+        "event_types": ["milestone_released"],
+        "dedup_key_template": "{tenant}:{milestone}",
+    }
+    parsed = parse_policy_set(_set(first, second))
+    assert isinstance(parsed, MalformedPolicySet)
+    assert "release-listing" in parsed.detail
+    assert "release-announcement" in parsed.detail
+    assert "policy_id" in parsed.detail
+
+
+def test_identical_templates_with_policy_id_are_safe():
+    # Distinct ids render distinct keys, whatever else the templates share —
+    # which is exactly why the default template is collision-proof.
+    first = _entry("p1") | {"dedup_key_template": "{tenant}:{policy_id}:{event_id}"}
+    second = _entry("p2") | {"dedup_key_template": "{tenant}:{policy_id}:{event_id}"}
+    assert isinstance(parse_policy_set(_set(first, second)), PolicySet)
+
+
+def test_identical_templates_with_disjoint_event_types_are_safe():
+    # No envelope is ever evaluated by both entries, so the identical template
+    # cannot produce a same-envelope collision. (Two different envelopes CAN
+    # still meet on equal field values — the engine's runtime guard owns that.)
+    first = _entry("p1") | {
+        "event_types": ["item_completed"],
+        "dedup_key_template": "{tenant}:{event_id}",
+    }
+    second = _entry("p2") | {
+        "event_types": ["item_reopened"],
+        "dedup_key_template": "{tenant}:{event_id}",
+    }
+    assert isinstance(parse_policy_set(_set(first, second)), PolicySet)
+
+
+def test_dedup_template_fields_is_the_one_shared_parse():
+    # Public and cached: parse-time validation and the engine's per-delivery
+    # render both read templates through this one function, so the hot path
+    # never re-parses and the two ends of the contract cannot drift.
+    assert dedup_template_fields("{tenant}:{policy_id}:{event_id}") == frozenset(
+        {"tenant", "policy_id", "event_id"}
+    )
+    assert dedup_template_fields("no placeholders") == frozenset()
+    # lru_cache: the same template string yields the very same parse result.
+    assert dedup_template_fields("{tenant}:{scope}") is dedup_template_fields(
+        "{tenant}:{scope}"
+    )
+
+
+@pytest.mark.parametrize(
+    "template,fragment",
+    [
+        ("{tenant}:{policy_id", "not a valid format string"),
+        ("{event_id:{pad}}", "nested placeholder"),
+        ("{tenant!q}", "unknown conversion"),
+    ],
+)
+def test_dedup_template_fields_raises_on_deferred_crash_forms(template, fragment):
+    # The same forms _validate_dedup_template rejects — because it rejects
+    # them BY calling this.
+    with pytest.raises(ValueError, match=fragment):
+        dedup_template_fields(template)
 
 
 def test_type_incompatible_format_spec_is_malformed():

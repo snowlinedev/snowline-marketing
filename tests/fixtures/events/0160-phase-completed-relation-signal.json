@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000116",
+  "event_type": "initiative_phase_completed",
+  "tenant": "turtlesedge",
+  "occurred_at": "2026-08-02T09:15:00+00:00",
+  "subject": {
+    "kind": "initiative",
+    "id": "c8e21f40",
+    "phase": "build"
+  },
+  "payload": {
+    "scope": "turtlesedge/turtletracks",
+    "initiative": "autumn-release",
+    "phase": "build",
+    "relations": [
+      {"kind": "marketing-impact", "target": "b964d217"},
+      {"kind": "blocks", "target": "c0119e34"}
+    ],
+    "signals": [],
+    "external_refs": [],
+    "details": {
+      "title": "Autumn release",
+      "next_phase": "launch",
+      "note": "spec §9's COMPATIBILITY path: the marketing-impact fact arrives as an item RELATION and payload.signals is empty, so only a relations predicate selects this event."
+    }
+  }
+}

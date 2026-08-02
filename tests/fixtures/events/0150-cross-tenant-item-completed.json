@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000115",
+  "event_type": "item_completed",
+  "tenant": "snowlinedev",
+  "occurred_at": "2026-08-01T11:12:44+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "a70b3d55"
+  },
+  "payload": {
+    "scope": "snowlinedev/snowline",
+    "initiative": "summer-release",
+    "milestone": "v1.4",
+    "work_kind": "implementation",
+    "relations": [
+      {"kind": "marketing-impact", "target": "8ad41b77"}
+    ],
+    "signals": ["marketing-impact"],
+    "external_refs": [],
+    "details": {
+      "title": "Another organization's work, delivered into this stream",
+      "note": "a VALID envelope from a different tenant — everything a turtlesedge policy predicates on would match, which is the point: isolation is the set's own tenant, not a predicate. Quarantined, never routed (spec §14)."
+    }
+  }
+}
