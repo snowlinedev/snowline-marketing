@@ -14,6 +14,19 @@ Env vars:
   MARKETING_BASE_URL       — where THIS plugin runs, the `base_url` it hands
                              the platform at registration so the gateway can
                              proxy to it.
+  MARKETING_GOVERNANCE_URL — where the governance service runs. Policies are
+                             governance artifacts (spec §6) and this is the
+                             base URL `policy_source.GatewayPolicyProvider`
+                             resolves the current policy-set version from.
+                             MARKETING-prefixed, unlike SNOWLINE_PLATFORM_URL:
+                             the shared unprefixed vars name things every
+                             plugin needs (the platform, the heartbeat
+                             cadence), whereas a governance base URL is this
+                             plugin's own dependency — the house convention is
+                             that each service publishes its own
+                             `*_BASE_URL`, and inventing an unprefixed
+                             SNOWLINE_GOVERNANCE_URL here would collide with
+                             governance's own knob for a different meaning.
   MARKETING_BIND_HOST      — the host this service binds to. Defaults to the
                              loopback address (spec §2: "loopback bind") — a
                              deploy that wants tailnet exposure sets this
@@ -48,6 +61,11 @@ DEFAULT_PLATFORM_URL = "http://127.0.0.1:8850"
 # Where this plugin advertises itself to the platform (the manifest `base_url`).
 DEFAULT_BASE_URL = "http://127.0.0.1:8805"
 
+# Where governance lives — the service holding the policy-set artifacts (spec
+# §6). Matches governance's OWN default base URL, so a single-host dev box
+# needs no configuration at all.
+DEFAULT_GOVERNANCE_URL = "http://127.0.0.1:8848"
+
 # Loopback-first bind (spec §2) — a deploy that wants tailnet/LAN exposure
 # sets MARKETING_BIND_HOST explicitly; the service never defaults to a
 # wildcard.
@@ -71,6 +89,11 @@ def platform_url() -> str:
 
 def base_url() -> str:
     return os.environ.get("MARKETING_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+def governance_url() -> str:
+    raw = os.environ.get("MARKETING_GOVERNANCE_URL", DEFAULT_GOVERNANCE_URL)
+    return raw.rstrip("/")
 
 
 def bind_host() -> str:

@@ -11,6 +11,14 @@ inherit a safe default without each one having to remember to set it.
 malformed cases), shared by the source, intake-loop and envelope tests so they
 all assert against the SAME capture rather than each inventing its own.
 
+`policy_fixtures_dir` points at `tests/fixtures/policies/` — Turtle's Edge's
+policy-set document (every consequence type, both the default and custom
+dedup templates) plus one file per malformed class. Unlike the event fixtures
+these carry NO `NNNN-` prefix: events are a STREAM whose file names are the
+cursor's resume tokens, while each policy file is a standalone artifact body
+resolved by name. A numeric prefix here would imply an ordering that does not
+exist.
+
 `migrated_db` mirrors the house plugin idiom: a disposable Postgres database,
 migrated with `alembic upgrade head` (exercising the migration chain), that
 `pytest.skip`s with a clear message when Postgres is unreachable (or
@@ -29,6 +37,12 @@ import pytest
 
 # The shipped capture (spec §5: fixtures mode is a first-class dev/CI surface).
 EVENT_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "events"
+
+# The shipped policy-set documents (spec §6). Fixtures-first applies to
+# policies exactly as it does to events: the deterministic core is built and
+# tested against these, with the gateway an integration point rather than a
+# build prerequisite.
+POLICY_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "policies"
 
 # Point marketing's DB layer at the disposable test database BEFORE any
 # marketing module builds its (lazy) engine.
@@ -145,6 +159,26 @@ def _cursor_rows_do_not_leak(request):
 
 
 @pytest.fixture(autouse=True)
+def _policy_cache_rows_do_not_leak(request):
+    """Any DB-backed test leaves `policy_cache` EMPTY behind it — the same
+    isolation rule as `_cursor_rows_do_not_leak`, for the same reason. Cache
+    rows key on a governance VERSION ID, and tests naturally reuse a handful of
+    readable ids ('pv-0001'); a row leaked by one test would silently become
+    another test's cache HIT, so a test asserting a fetch-and-store path would
+    pass while storing nothing."""
+    yield
+    if "migrated_db" not in request.fixturenames:
+        return
+    import sqlalchemy as sa_
+
+    from snowline_marketing.db import session_scope
+    from snowline_marketing.models import CachedPolicySet
+
+    with session_scope() as session:
+        session.execute(sa_.delete(CachedPolicySet))
+
+
+@pytest.fixture(autouse=True)
 def _marketing_stays_disabled(monkeypatch):
     """MARKETING_ENABLED must NEVER be true inside the suite: a dev shell's
     `export MARKETING_ENABLED=1` (natural while working on a later intake/
@@ -158,6 +192,12 @@ def _marketing_stays_disabled(monkeypatch):
 def event_fixtures_dir() -> Path:
     """The shipped event capture directory (see module docstring)."""
     return EVENT_FIXTURES_DIR
+
+
+@pytest.fixture
+def policy_fixtures_dir() -> Path:
+    """The shipped policy-set fixture directory (see module docstring)."""
+    return POLICY_FIXTURES_DIR
 
 
 def _db_name(url: str) -> str:

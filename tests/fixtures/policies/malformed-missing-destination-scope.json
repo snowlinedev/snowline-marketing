@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "tenant": "turtlesedge",
+  "policies": [
+    {
+      "policy_id": "announcement-preparation-on-release",
+      "event_types": ["milestone_released"],
+      "consequence": "announcement_preparation",
+      "destination": {
+        "initiative": "announcements"
+      },
+      "title_template": "Prepare the {milestone} announcement",
+      "body_template": "A destination that names an initiative but no scope. Minting would have to guess where the work lands, and routing is isolation-safe by contract (spec §14)."
+    }
+  ]
+}

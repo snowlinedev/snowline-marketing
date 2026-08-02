@@ -74,6 +74,17 @@ def test_base_url_default_and_strips_trailing_slash(monkeypatch):
     assert config.base_url() == "http://marketing.example"
 
 
+def test_governance_url_default_and_strips_trailing_slash(monkeypatch):
+    # Policies are governance artifacts (spec §6); this is where the policy
+    # provider resolves the current version from. MARKETING-prefixed, unlike
+    # SNOWLINE_PLATFORM_URL — the unprefixed vars name what EVERY plugin
+    # needs, and governance already publishes its own base-URL knob.
+    monkeypatch.delenv("MARKETING_GOVERNANCE_URL", raising=False)
+    assert config.governance_url() == "http://127.0.0.1:8848"
+    monkeypatch.setenv("MARKETING_GOVERNANCE_URL", "http://governance.example/")
+    assert config.governance_url() == "http://governance.example"
+
+
 def test_heartbeat_interval_env_is_lenient(monkeypatch):
     # A malformed or hot-looping value in the SHARED env var must not kill the
     # heartbeat (a dead heartbeat = a hollow gateway after the next platform

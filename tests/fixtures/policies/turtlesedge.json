@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "tenant": "turtlesedge",
+  "policies": [
+    {
+      "policy_id": "messaging-refresh-on-marketing-impact",
+      "event_types": ["item_completed", "semantic_signal"],
+      "predicates": {
+        "scope": ["turtlesedge/*"],
+        "signals": ["marketing-impact"]
+      },
+      "consequence": "messaging_refresh",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "messaging"
+      },
+      "title_template": "Refresh messaging for {subject_title}",
+      "body_template": "{event_type} on {scope} carried a marketing-impact signal. Review the canonical messaging artifact and refresh what changed.",
+      "artifact_refs": ["b964d217"],
+      "deliverable_classes": ["positioning_copy"],
+      "human_owned": true
+    },
+    {
+      "policy_id": "listing-regeneration-on-release",
+      "event_types": ["milestone_released"],
+      "predicates": {
+        "scope": ["turtlesedge/turtletracks"],
+        "milestone": ["v*"]
+      },
+      "consequence": "listing_regeneration",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "app-store",
+        "phase": "release"
+      },
+      "title_template": "Regenerate the App Store listing for {milestone}",
+      "body_template": "Milestone {milestone} released on {scope}. Regenerate the store listing from the canonical listing artifact.",
+      "channels": ["app_store"],
+      "deliverable_classes": ["store_listing"],
+      "dedup_key_template": "{tenant}:{policy_id}:{milestone}",
+      "mode": "active"
+    },
+    {
+      "policy_id": "screenshot-review-on-ui-work",
+      "event_types": ["item_completed"],
+      "predicates": {
+        "scope": ["turtlesedge/turtletracks"],
+        "work_kind": ["ui", "design*"]
+      },
+      "consequence": "screenshot_review",
+      "destination": {
+        "scope": "turtlesedge/marketing"
+      },
+      "title_template": "Review screenshots after {subject_title}",
+      "body_template": "UI work landed on {scope}. Check whether the shipped screenshot set still reflects the app.",
+      "channels": ["app_store"],
+      "deliverable_classes": ["screenshot_set"],
+      "musher_dispatch": false
+    },
+    {
+      "policy_id": "announcement-preparation-on-release",
+      "event_types": ["milestone_released"],
+      "predicates": {
+        "milestone": ["v*"]
+      },
+      "consequence": "announcement_preparation",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "announcements"
+      },
+      "title_template": "Prepare the {milestone} announcement",
+      "body_template": "Draft the release announcement for {milestone} from the canonical what's-new artifact.",
+      "owner_template": "{tenant}-marketing",
+      "artifact_refs": ["b964d217"],
+      "channels": ["blog", "mailing_list"],
+      "deliverable_classes": ["announcement_post"],
+      "musher_dispatch": true
+    },
+    {
+      "policy_id": "launch-plan-on-build-phase-completed",
+      "event_types": ["initiative_phase_completed"],
+      "predicates": {
+        "scope": ["turtlesedge/*"],
+        "phase": ["build"],
+        "relations": ["marketing-impact"]
+      },
+      "consequence": "launch_plan",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "launches",
+        "phase": "plan"
+      },
+      "title_template": "Launch plan for {initiative}",
+      "body_template": "The build phase of {initiative} completed on {scope}. Draft the launch plan before the release milestone.",
+      "mode": "approval_required"
+    },
+    {
+      "policy_id": "monthly-review-sweep",
+      "event_types": ["recurring_item_fired"],
+      "consequence": "review_sweep",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "monthly-loop"
+      },
+      "title_template": "Monthly marketing review sweep",
+      "body_template": "The monthly schedule fired. Sweep listings, screenshots and messaging for staleness.",
+      "human_owned": true
+    },
+    {
+      "policy_id": "monthly-metrics-snapshot",
+      "event_types": ["recurring_item_fired"],
+      "consequence": "metrics_snapshot",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "monthly-loop"
+      },
+      "title_template": "Metrics snapshot for {scope}",
+      "body_template": "Capture the monthly channel metrics snapshot for {scope}.",
+      "channels": ["app_store", "website"],
+      "deliverable_classes": ["metrics_snapshot"],
+      "dedup_key_template": "{tenant}:{policy_id}:{event_id}:{scope}",
+      "mode": "dry_run"
+    },
+    {
+      "policy_id": "app-store-listing-publish",
+      "event_types": ["milestone_released"],
+      "predicates": {
+        "scope": ["turtlesedge/turtletracks"],
+        "milestone": ["v*"]
+      },
+      "consequence": "channel_publish",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "app-store",
+        "phase": "release"
+      },
+      "title_template": "Publish the {milestone} listing to App Store Connect",
+      "body_template": "Apply the approved canonical listing content for {milestone}. Dry-run diff first; the push is approval-gated.",
+      "artifact_refs": ["b964d217"],
+      "channels": ["app_store"],
+      "deliverable_classes": ["store_listing", "whats_new"],
+      "mode": "approval_required"
+    }
+  ]
+}
