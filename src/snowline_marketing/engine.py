@@ -81,6 +81,7 @@ from snowline_marketing.ledger import (
     DeliveryLedger,
     DeliveryOutcome,
     LedgerRecord,
+    LedgerStore,
 )
 from snowline_marketing.matching import matching_entries
 from snowline_marketing.policies import (
@@ -93,7 +94,7 @@ from snowline_marketing.policies import (
     PolicySet,
     dedup_template_fields,
 )
-from snowline_marketing.policy_cache import PolicyCache
+from snowline_marketing.policy_cache import PolicyCache, PolicyCacheStore
 from snowline_marketing.policy_source import (
     PolicyProvider,
     PolicyResolutionError,
@@ -369,7 +370,7 @@ def resolve_policy_set(
     tenant: str,
     *,
     provider: PolicyProvider,
-    cache: PolicyCache | None = None,
+    cache: PolicyCacheStore | None = None,
 ) -> PolicyResolution:
     """Resolve, cache and classify `tenant`'s current policy version.
 
@@ -377,7 +378,9 @@ def resolve_policy_set(
     current (never raising — it returns typed failures), `cache.put` persists the
     body and OWNS the classification (so the row's verdict cannot disagree with
     the bytes it stored), and this function maps the result onto the three
-    things evaluation can do about it.
+    things evaluation can do about it. `cache` takes `PolicyCacheStore` — the
+    `put` surface only — so §11's dry-run can pass an `InMemoryPolicyCache` and
+    classify a candidate body without a row ever landing in `policy_cache`.
 
     `cache.put` writes to the database and therefore may raise if the database is
     down. Deliberately not caught: a policy version we could not record is a
@@ -475,7 +478,7 @@ def evaluate(
     envelope: EventEnvelope,
     resolution: PolicyResolution,
     *,
-    ledger: DeliveryLedger | None = None,
+    ledger: LedgerStore | None = None,
 ) -> EvaluationOutcome:
     """Evaluate one envelope against one tenant's resolution — the core.
 
@@ -488,7 +491,9 @@ def evaluate(
 
     `resolution` is passed in rather than resolved here so that one pass
     resolves once (see `EvaluationHandler`) and so that §11's dry-run can point
-    the same code at a version that is NOT the tenant's current one."""
+    the same code at a version that is NOT the tenant's current one. `ledger`
+    takes `LedgerStore` — the `record` surface only — so that same dry-run can
+    pass an `InMemoryDeliveryLedger` and leave no trace in `delivery_ledger`."""
     if isinstance(resolution, EvaluationStalled):
         # Nothing is recorded and nothing is consumed. Passing the stall
         # straight through keeps every caller on one code path: they check the
@@ -726,8 +731,8 @@ class EvaluationHandler:
         tenant: str,
         *,
         provider: PolicyProvider,
-        cache: PolicyCache | None = None,
-        ledger: DeliveryLedger | None = None,
+        cache: PolicyCacheStore | None = None,
+        ledger: LedgerStore | None = None,
     ) -> None:
         self.tenant = tenant
         self._provider = provider

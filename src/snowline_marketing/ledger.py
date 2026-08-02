@@ -50,13 +50,23 @@ This module deliberately knows nothing about policies, envelopes or matching.
 It stores what it is told, and the engine decides what to tell it — which is
 what lets the ledger be tested against a real database with no policy artifact
 in sight.
+
+`LedgerStore` is the protocol `engine.evaluate` actually depends on — the
+`record` surface, and nothing else the engine ever calls. `InMemoryDeliveryLedger`
+is its second implementation, held in the process rather than Postgres: the
+store spec §11's dry-run drives, so a preview's dedup behavior against a
+captured stream is provably the SAME as evaluating for real, not a
+lookalike that happens to agree today. It mirrors the guard and the namespace
+derivation above via the same helper `DeliveryLedger.record` calls, so the two
+stores cannot drift apart on the one thing a dry-run's honesty depends on.
 """
 
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -155,6 +165,65 @@ class LedgerWrite:
     inserted: bool
 
 
+def _namespaced_key(
+    dedup_key: str, *, outcome: DeliveryOutcome, policy_id: str | None
+) -> str:
+    """Validate the outcome<->policy_id invariant and return the STORED,
+    namespaced key ("e:"/"p:", see the module docstring).
+
+    Shared by `DeliveryLedger.record` and `InMemoryDeliveryLedger.record` so
+    the guard and the namespace derivation — the two things that make a
+    dry-run's dedup behavior identical to production's — exist in exactly one
+    place and cannot drift between the two stores.
+
+    Raises ValueError — before touching either store — when `outcome` and
+    `policy_id` disagree about the delivery's level: `EVENT_LEVEL_OUTCOMES`
+    may not name a policy, every other outcome must. The database CHECK
+    enforces the same invariant for `DeliveryLedger`; guarding here too keeps
+    the refusal loud and typed instead of a driver-shaped IntegrityError (and
+    `InMemoryDeliveryLedger` has no CHECK to fall back on at all)."""
+    if outcome in EVENT_LEVEL_OUTCOMES and policy_id is not None:
+        raise ValueError(
+            f"event-level outcome {outcome.value!r} must not name a policy "
+            f"(got policy_id={policy_id!r}) — ignored/quarantined are facts "
+            "about an event, not about a rule"
+        )
+    if outcome not in EVENT_LEVEL_OUTCOMES and policy_id is None:
+        raise ValueError(
+            f"policy-level outcome {outcome.value!r} must name the policy "
+            "that produced it"
+        )
+    # The guard above just made "names a policy" equivalent to "is a
+    # policy-level outcome", so the namespace derives from either; the
+    # policy id is the one the type system already distinguishes.
+    namespace = _EVENT_KEY_NAMESPACE if policy_id is None else _POLICY_KEY_NAMESPACE
+    return namespace + dedup_key
+
+
+class LedgerStore(Protocol):
+    """What `engine.evaluate` needs from a delivery ledger — the `record`
+    surface, and nothing else the engine ever calls.
+
+    `DeliveryLedger` (Postgres) and `InMemoryDeliveryLedger` (spec §11's
+    dry-run) both satisfy this without inheriting from it — the engine takes
+    the protocol so a dry-run can point the same deterministic core at a store
+    that leaves no trace, and `engine.py` never has to import, or know about,
+    the dry-run at all."""
+
+    def record(
+        self,
+        *,
+        tenant: str,
+        dedup_key: str,
+        event_id: str,
+        event_type: str,
+        outcome: DeliveryOutcome,
+        policy_id: str | None = None,
+        policy_version_id: str | None = None,
+        detail: str | None = None,
+    ) -> LedgerWrite: ...
+
+
 class DeliveryLedger:
     """The `delivery_ledger` table (spec §4)."""
 
@@ -185,11 +254,7 @@ class DeliveryLedger:
         the key at the moment the claim was decided.
 
         Raises ValueError — before touching the database — when `outcome` and
-        `policy_id` disagree about the delivery's level: `EVENT_LEVEL_OUTCOMES`
-        may not name a policy, every other outcome must. The database CHECK
-        enforces the same invariant; guarding here too keeps the refusal loud
-        and typed instead of a driver-shaped IntegrityError, and is what makes
-        the namespace derivation below unambiguous.
+        `policy_id` disagree about the delivery's level (see `_namespaced_key`).
 
         Raises like any other store call if the database is unreachable — the
         never-raises contract belongs to the CLASSIFIERS (malformed input is an
@@ -197,22 +262,7 @@ class DeliveryLedger:
         swallowing it here would ack an event whose audit row was never
         written. The intake loop already turns the exception into a stopped
         pass with the position un-acked."""
-        if outcome in EVENT_LEVEL_OUTCOMES and policy_id is not None:
-            raise ValueError(
-                f"event-level outcome {outcome.value!r} must not name a policy "
-                f"(got policy_id={policy_id!r}) — ignored/quarantined are facts "
-                "about an event, not about a rule"
-            )
-        if outcome not in EVENT_LEVEL_OUTCOMES and policy_id is None:
-            raise ValueError(
-                f"policy-level outcome {outcome.value!r} must name the policy "
-                "that produced it"
-            )
-        # The guard above just made "names a policy" equivalent to "is a
-        # policy-level outcome", so the namespace derives from either; the
-        # policy id is the one the type system already distinguishes.
-        namespace = _EVENT_KEY_NAMESPACE if policy_id is None else _POLICY_KEY_NAMESPACE
-        dedup_key = namespace + dedup_key
+        dedup_key = _namespaced_key(dedup_key, outcome=outcome, policy_id=policy_id)
         statement = (
             pg_insert(DeliveryLedgerRow)
             .values(
@@ -303,3 +353,105 @@ def _to_record(row: DeliveryLedgerRow) -> LedgerRecord:
         created_item_ref=row.created_item_ref,
         detail=row.detail,
     )
+
+
+class InMemoryDeliveryLedger:
+    """A delivery ledger held in the process — spec §11's dry-run ledger.
+
+    Not a mock: this is the store a dry-run drives, the way `InMemoryCursorStore`
+    is the store a dry-run points the intake loop's cursor at (`cursors.py`) —
+    "a dry-run that moved the real cursor would eat the events it was only
+    supposed to preview" applies to the ledger identically, and a real
+    `matched` row would be a claim on work a dry-run must never actually own.
+
+    Faithful, not merely a stand-in: first-insert-wins on `(tenant, dedup_key)`
+    — a dict keyed on exactly that pair, so a second `record` call for a
+    claimed key returns the EXISTING row untouched, `inserted=False`, same as
+    `DeliveryLedger`'s `ON CONFLICT DO NOTHING` — the same "p:"/"e:" namespace
+    derivation, and the same outcome<->policy_id guard, all three via the
+    shared `_namespaced_key` helper `DeliveryLedger.record` itself calls. That
+    is what makes a dry-run's dedup behavior against a captured stream provably
+    the SAME as evaluating for real: within one dry-run, the same event
+    delivered twice converges to one row exactly as it would in production.
+
+    Satisfies `LedgerStore`, which is all `evaluate` requires; `get`,
+    `for_event` and `list_for_tenant` mirror `DeliveryLedger`'s read surface
+    for symmetry and for building §11's report.
+
+    Not process-safe or thread-safe, unlike `DeliveryLedger`, whose uniqueness
+    the DATABASE enforces under concurrency (module docstring: "idempotent
+    under concurrency, not just under re-delivery"). A dry-run is a single
+    caller driving a single capture through in one thread, which is the only
+    claim this store needs to make good on."""
+
+    def __init__(self) -> None:
+        self._rows: dict[tuple[str, str], LedgerRecord] = {}
+
+    def record(
+        self,
+        *,
+        tenant: str,
+        dedup_key: str,
+        event_id: str,
+        event_type: str,
+        outcome: DeliveryOutcome,
+        policy_id: str | None = None,
+        policy_version_id: str | None = None,
+        detail: str | None = None,
+    ) -> LedgerWrite:
+        """See `LedgerStore.record` / `DeliveryLedger.record`. Raises the same
+        ValueError, on the same terms, before either store is touched."""
+        stored_key = _namespaced_key(dedup_key, outcome=outcome, policy_id=policy_id)
+        key = (tenant, stored_key)
+        existing = self._rows.get(key)
+        if existing is not None:
+            # First-insert-wins, same as `ON CONFLICT DO NOTHING`: the
+            # existing row is returned untouched, and the caller learns this
+            # delivery owes no new work.
+            return LedgerWrite(record=existing, inserted=False)
+        record = LedgerRecord(
+            tenant=tenant,
+            dedup_key=stored_key,
+            event_id=event_id,
+            event_type=event_type,
+            outcome=outcome,
+            created_at=datetime.now(timezone.utc),
+            policy_id=policy_id,
+            policy_version_id=policy_version_id,
+            created_item_ref=None,
+            detail=detail,
+        )
+        self._rows[key] = record
+        return LedgerWrite(record=record, inserted=True)
+
+    def get(self, tenant: str, dedup_key: str) -> LedgerRecord | None:
+        """See `DeliveryLedger.get`. Takes the STORED (namespaced) key."""
+        return self._rows.get((tenant, dedup_key))
+
+    def for_event(self, tenant: str, event_id: str) -> list[LedgerRecord]:
+        """See `DeliveryLedger.for_event`. Oldest first, same tie-break."""
+        return sorted(
+            (
+                record
+                for (row_tenant, _), record in self._rows.items()
+                if row_tenant == tenant and record.event_id == event_id
+            ),
+            key=lambda record: (record.created_at, record.dedup_key),
+        )
+
+    def list_for_tenant(
+        self, tenant: str, *, limit: int | None = None
+    ) -> list[LedgerRecord]:
+        """See `DeliveryLedger.list_for_tenant`. Newest first, same tie-break."""
+        rows = sorted(
+            (
+                record
+                for (row_tenant, _), record in self._rows.items()
+                if row_tenant == tenant
+            ),
+            key=lambda record: (record.created_at, record.dedup_key),
+            reverse=True,
+        )
+        if limit is not None:
+            rows = rows[: max(0, limit)]
+        return rows

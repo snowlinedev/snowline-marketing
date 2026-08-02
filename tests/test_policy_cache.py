@@ -23,7 +23,11 @@ from snowline_marketing.policies import (
     MalformedPolicySet,
     PolicySet,
 )
-from snowline_marketing.policy_cache import ParseOutcome, PolicyCache
+from snowline_marketing.policy_cache import (
+    InMemoryPolicyCache,
+    ParseOutcome,
+    PolicyCache,
+)
 from snowline_marketing.policy_source import ResolvedPolicySet
 
 VALID_BODY = (POLICY_FIXTURES_DIR / "turtlesedge.json").read_text()
@@ -356,3 +360,91 @@ def test_a_cross_tenant_id_collision_is_refused(migrated_db):
     assert resolution.reason is StallReason.policy_quarantined
     assert resolution.version_id == "pv-0001"
     assert "version_collision" in resolution.detail
+
+
+# --- InMemoryPolicyCache (spec §11's dry-run cache) ---------------------------
+#
+# No `migrated_db`: the whole point is not needing Postgres. What is pinned is
+# that classification and the tenant-guarded upsert behave IDENTICALLY to
+# `PolicyCache`, so a dry-run's quarantine verdict is provably the same one
+# production would give the same body.
+
+
+def test_in_memory_a_valid_version_round_trips():
+    cache = InMemoryPolicyCache()
+    parsed = cache.put(_resolved(VERSION_ID, VALID_BODY))
+    assert isinstance(parsed, PolicySet)
+    row = cache.get(VERSION_ID)
+    assert row is not None
+    assert row.tenant == TENANT
+    assert row.outcome is ParseOutcome.valid
+    assert row.quarantine_reason is None
+    assert row.body == VALID_BODY
+
+
+def test_in_memory_a_quarantined_version_persists_with_its_reason():
+    cache = InMemoryPolicyCache()
+    parsed = cache.put(_resolved("gv-prose", PROSE_BODY))
+    assert isinstance(parsed, MalformedPolicySet)
+    row = cache.get("gv-prose")
+    assert row is not None
+    assert row.outcome is ParseOutcome.quarantined
+    assert row.quarantine_reason == MalformedPolicyReason.not_json.value
+    assert row.quarantine_detail
+
+
+def test_in_memory_unknown_version_reads_as_none():
+    assert InMemoryPolicyCache().get("gv-never-fetched") is None
+
+
+def test_in_memory_put_upserts_the_same_tenant():
+    cache = InMemoryPolicyCache()
+    cache.put(_resolved(VERSION_ID, PROSE_BODY))
+    cache.put(_resolved(VERSION_ID, VALID_BODY))
+    row = cache.get(VERSION_ID)
+    assert row is not None
+    assert row.outcome is ParseOutcome.valid
+    assert row.quarantine_reason is None
+
+
+def test_in_memory_a_tenant_mismatched_body_quarantines():
+    cache = InMemoryPolicyCache()
+    parsed = cache.put(_resolved("gv-cross", VALID_BODY, tenant="snowlinedev"))
+    assert isinstance(parsed, MalformedPolicySet)
+    assert parsed.reason is MalformedPolicyReason.tenant_mismatch
+    row = cache.get("gv-cross")
+    assert row is not None
+    assert row.tenant == "snowlinedev"
+    assert row.outcome is ParseOutcome.quarantined
+
+
+def test_in_memory_a_cross_tenant_id_collision_is_refused():
+    # Same guard as `PolicyCache.put` (see its module docstring): a
+    # caller-chosen version id reused across tenants must not let the second
+    # writer silently steal the first tenant's row.
+    import json
+
+    cache = InMemoryPolicyCache()
+    cache.put(_resolved("pv-0001", VALID_BODY, tenant=TENANT))
+    other = json.loads(VALID_BODY)
+    other["tenant"] = "snowlinedev"
+    other_body = json.dumps(other)
+    refused = cache.put(_resolved("pv-0001", other_body, tenant="snowlinedev"))
+
+    assert isinstance(refused, MalformedPolicySet)
+    assert refused.reason is MalformedPolicyReason.version_collision
+    assert "pv-0001" in refused.detail
+    assert TENANT in refused.detail and "snowlinedev" in refused.detail
+
+    row = cache.get("pv-0001")
+    assert row is not None
+    assert row.tenant == TENANT  # first writer keeps the row
+    assert row.body == VALID_BODY
+
+
+def test_in_memory_put_returns_the_classification():
+    cache = InMemoryPolicyCache()
+    valid = cache.put(_resolved(VERSION_ID, VALID_BODY))
+    assert isinstance(valid, PolicySet)
+    quarantined = cache.put(_resolved("gv-prose", PROSE_BODY))
+    assert isinstance(quarantined, MalformedPolicySet)

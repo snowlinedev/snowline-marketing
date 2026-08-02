@@ -21,7 +21,11 @@ import sqlalchemy as sa
 from conftest import TENANT
 
 from snowline_marketing.db import session_scope
-from snowline_marketing.ledger import DeliveryLedger, DeliveryOutcome
+from snowline_marketing.ledger import (
+    DeliveryLedger,
+    DeliveryOutcome,
+    InMemoryDeliveryLedger,
+)
 from snowline_marketing.models import DeliveryLedgerEntry as DeliveryLedgerRow
 
 VERSION_ID = "gv-7f3a91c4"
@@ -389,3 +393,168 @@ def test_failed_is_a_storable_outcome_for_later(migrated_db):
         detail="minting raised; §11 owns the retry",
     )
     assert write.record.outcome is DeliveryOutcome.failed
+
+
+# --- InMemoryDeliveryLedger (spec §11's dry-run store) ------------------------
+#
+# No `migrated_db` here: the whole point of this store is not needing Postgres.
+# What is pinned is that it behaves IDENTICALLY to `DeliveryLedger` on every
+# property the engine's dry-run honesty depends on — first-insert-wins,
+# namespace derivation, the outcome<->policy_id guard — so these largely
+# mirror the DB-backed tests above with the store swapped out.
+
+
+def test_in_memory_a_fresh_key_is_claimed():
+    write = _matched(InMemoryDeliveryLedger())
+    assert write.inserted
+    assert write.record.dedup_key == f"p:{KEY}"
+    assert write.record.outcome is DeliveryOutcome.matched
+    assert write.record.created_item_ref is None
+    assert write.record.created_at is not None
+
+
+def test_in_memory_a_repeat_delivery_finds_the_key_taken():
+    ledger = InMemoryDeliveryLedger()
+    first = _matched(ledger)
+    second = _matched(ledger)
+    assert first.inserted
+    assert not second.inserted
+    assert second.record == first.record
+
+
+def test_in_memory_never_overwrites_the_row():
+    # The same "DO NOTHING, never DO UPDATE" contract: a matched row advanced
+    # to `created` (as the real ledger's `test_a_repeat_delivery_never_
+    # overwrites_the_row` does via a direct SQL update — this store has no
+    # SQL, so a direct dict write plays the same role) must survive a
+    # re-delivery within the same run, the same way it does for the real
+    # store.
+    import dataclasses
+
+    ledger = InMemoryDeliveryLedger()
+    first = _matched(ledger)
+    key = (TENANT, first.record.dedup_key)
+    ledger._rows[key] = dataclasses.replace(
+        first.record, outcome=DeliveryOutcome.created, created_item_ref="pm-item-42"
+    )
+    repeat = _matched(ledger, detail="a later delivery, saying something else")
+    assert not repeat.inserted
+    assert repeat.record.outcome is DeliveryOutcome.created
+    assert repeat.record.created_item_ref == "pm-item-42"
+
+
+def test_in_memory_the_same_key_under_two_tenants_is_two_rows():
+    ledger = InMemoryDeliveryLedger()
+    bare_key = "messaging-refresh:pm-evt-0000101"
+    mine = ledger.record(
+        tenant=TENANT,
+        dedup_key=bare_key,
+        policy_id="messaging-refresh",
+        event_id="pm-evt-0000101",
+        event_type="item_completed",
+        outcome=DeliveryOutcome.matched,
+        policy_version_id=VERSION_ID,
+    )
+    theirs = ledger.record(
+        tenant="snowlinedev",
+        dedup_key=bare_key,
+        policy_id="messaging-refresh",
+        event_id="pm-evt-0000101",
+        event_type="item_completed",
+        outcome=DeliveryOutcome.matched,
+        policy_version_id="gv-other",
+    )
+    assert mine.inserted and theirs.inserted
+    assert ledger.get(TENANT, f"p:{bare_key}").policy_version_id == VERSION_ID
+    assert ledger.get("snowlinedev", f"p:{bare_key}").policy_version_id == "gv-other"
+
+
+def test_in_memory_get_misses_return_none():
+    assert InMemoryDeliveryLedger().get(TENANT, "never-written") is None
+
+
+def test_in_memory_namespaces_policy_and_event_keys():
+    ledger = InMemoryDeliveryLedger()
+    policy = _matched(ledger)
+    event = ledger.record(
+        tenant=TENANT,
+        dedup_key=f"{TENANT}:pm-evt-0000200:ignored",
+        event_id="pm-evt-0000200",
+        event_type="item_reopened",
+        outcome=DeliveryOutcome.ignored,
+        detail="no entry selects this event",
+    )
+    assert policy.record.dedup_key.startswith("p:")
+    assert event.record.dedup_key == f"e:{TENANT}:pm-evt-0000200:ignored"
+
+
+def test_in_memory_a_forged_event_shape_cannot_reach_an_event_level_row():
+    ledger = InMemoryDeliveryLedger()
+    reserved = f"{TENANT}:pm-evt-0000300:ignored"
+    event = ledger.record(
+        tenant=TENANT,
+        dedup_key=reserved,
+        event_id="pm-evt-0000300",
+        event_type="item_reopened",
+        outcome=DeliveryOutcome.ignored,
+        detail="the real event-level row",
+    )
+    for forged in (reserved, f"e:{reserved}"):
+        write = _matched(ledger, dedup_key=forged, event_id="pm-evt-0000300")
+        assert write.inserted
+        assert write.record.dedup_key == f"p:{forged}"
+    assert event.record.dedup_key == f"e:{reserved}"
+
+
+def test_in_memory_refuses_an_event_level_outcome_naming_a_policy():
+    with pytest.raises(ValueError, match="must not name a policy"):
+        InMemoryDeliveryLedger().record(
+            tenant=TENANT,
+            dedup_key=f"{TENANT}:pm-evt-0000400:ignored",
+            policy_id="some-policy",
+            event_id="pm-evt-0000400",
+            event_type="item_reopened",
+            outcome=DeliveryOutcome.ignored,
+        )
+
+
+def test_in_memory_refuses_a_policy_level_outcome_without_a_policy():
+    with pytest.raises(ValueError, match="must name the policy"):
+        InMemoryDeliveryLedger().record(
+            tenant=TENANT,
+            dedup_key=f"{TENANT}:no-policy:pm-evt-0000401",
+            event_id="pm-evt-0000401",
+            event_type="item_completed",
+            outcome=DeliveryOutcome.matched,
+            policy_version_id=VERSION_ID,
+        )
+
+
+def test_in_memory_for_event_and_list_for_tenant_mirror_the_real_store():
+    ledger = InMemoryDeliveryLedger()
+    for policy_id in ("policy-a", "policy-b"):
+        ledger.record(
+            tenant=TENANT,
+            dedup_key=f"{TENANT}:{policy_id}:pm-evt-0000110",
+            policy_id=policy_id,
+            event_id="pm-evt-0000110",
+            event_type="milestone_released",
+            outcome=DeliveryOutcome.matched,
+            policy_version_id=VERSION_ID,
+        )
+    ledger.record(
+        tenant="snowlinedev",
+        dedup_key="snowlinedev:policy:0",
+        policy_id="policy",
+        event_id="pm-evt-0",
+        event_type="item_completed",
+        outcome=DeliveryOutcome.matched,
+        policy_version_id="gv-other",
+    )
+    rows = ledger.for_event(TENANT, "pm-evt-0000110")
+    assert {r.policy_id for r in rows} == {"policy-a", "policy-b"}
+    assert ledger.for_event(TENANT, "nothing-like-this") == []
+    assert len(ledger.list_for_tenant(TENANT)) == 2
+    assert len(ledger.list_for_tenant(TENANT, limit=1)) == 1
+    assert len(ledger.list_for_tenant("snowlinedev")) == 1
+    assert ledger.list_for_tenant("nobody") == []
