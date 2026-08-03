@@ -146,6 +146,32 @@ def _classify(
     return parsed, ParseOutcome.valid, None, None
 
 
+def _collision_refusal(
+    version_id: str, holder_tenant: str | None, tenant: str, body: str
+) -> MalformedPolicySet:
+    """The refusal both stores hand back when a caller-chosen version id
+    collides across tenants (module docstring: "The upsert is guarded on
+    TENANT, not on content").
+
+    Shared for the reason `_classify` is: the refusal's shape — reason
+    `version_collision`, a detail naming the version id and BOTH tenants (the
+    row's holder and the requester), the row left unchanged — is precisely the
+    behavior a dry-run must not weaken, so it exists in exactly one place
+    rather than two hand-copied constructions that could drift."""
+    return MalformedPolicySet(
+        reason=MalformedPolicyReason.version_collision,
+        detail=(
+            f"version id {version_id!r} is already cached for "
+            f"tenant {holder_tenant!r}; refused for tenant {tenant!r} — "
+            "the row is unchanged and the audit join is broken "
+            "until the collision is resolved"
+        ),
+        raw=body,
+        version_id=version_id,
+        tenant=tenant,
+    )
+
+
 class PolicyCacheStore(Protocol):
     """What `engine.resolve_policy_set` needs from a policy cache — `put`,
     and nothing else it ever calls.
@@ -253,18 +279,7 @@ class PolicyCache:
                     version_id,
                     tenant,
                 )
-                return MalformedPolicySet(
-                    reason=MalformedPolicyReason.version_collision,
-                    detail=(
-                        f"version id {version_id!r} is already cached for "
-                        f"tenant {holder!r}; refused for tenant {tenant!r} — "
-                        "the row is unchanged and the audit join is broken "
-                        "until the collision is resolved"
-                    ),
-                    raw=body,
-                    version_id=version_id,
-                    tenant=tenant,
-                )
+                return _collision_refusal(version_id, holder, tenant, body)
         return parsed
 
     def get(self, version_id: str) -> CachedPolicyVersion | None:
@@ -337,17 +352,8 @@ class InMemoryPolicyCache:
         if existing is not None and existing.tenant != resolved.tenant:
             # The tenant-guarded refusal (see class docstring): the row
             # belongs to another tenant, so this put does not touch it.
-            return MalformedPolicySet(
-                reason=MalformedPolicyReason.version_collision,
-                detail=(
-                    f"version id {resolved.version_id!r} is already cached "
-                    f"for tenant {existing.tenant!r}; refused for tenant "
-                    f"{resolved.tenant!r} — the row is unchanged and the "
-                    "audit join is broken until the collision is resolved"
-                ),
-                raw=resolved.body,
-                version_id=resolved.version_id,
-                tenant=resolved.tenant,
+            return _collision_refusal(
+                resolved.version_id, existing.tenant, resolved.tenant, resolved.body
             )
         self._rows[resolved.version_id] = CachedPolicyVersion(
             version_id=resolved.version_id,

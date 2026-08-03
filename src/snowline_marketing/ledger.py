@@ -374,9 +374,10 @@ class InMemoryDeliveryLedger:
     the SAME as evaluating for real: within one dry-run, the same event
     delivered twice converges to one row exactly as it would in production.
 
-    Satisfies `LedgerStore`, which is all `evaluate` requires; `get`,
-    `for_event` and `list_for_tenant` mirror `DeliveryLedger`'s read surface
-    for symmetry and for building §11's report.
+    Satisfies `LedgerStore`, which is all `evaluate` requires, plus `get` — a
+    trivial keyed lookup for tests to assert on what a dry-run recorded. The
+    read surface grows when §11's dashboard actually reads it; until then the
+    in-memory store implements exactly the `LedgerStore` protocol plus `get`.
 
     Not process-safe or thread-safe, unlike `DeliveryLedger`, whose uniqueness
     the DATABASE enforces under concurrency (module docstring: "idempotent
@@ -425,33 +426,6 @@ class InMemoryDeliveryLedger:
         return LedgerWrite(record=record, inserted=True)
 
     def get(self, tenant: str, dedup_key: str) -> LedgerRecord | None:
-        """See `DeliveryLedger.get`. Takes the STORED (namespaced) key."""
+        """See `DeliveryLedger.get`. Takes the STORED (namespaced) key. A
+        trivial keyed lookup with no ordering promise."""
         return self._rows.get((tenant, dedup_key))
-
-    def for_event(self, tenant: str, event_id: str) -> list[LedgerRecord]:
-        """See `DeliveryLedger.for_event`. Oldest first, same tie-break."""
-        return sorted(
-            (
-                record
-                for (row_tenant, _), record in self._rows.items()
-                if row_tenant == tenant and record.event_id == event_id
-            ),
-            key=lambda record: (record.created_at, record.dedup_key),
-        )
-
-    def list_for_tenant(
-        self, tenant: str, *, limit: int | None = None
-    ) -> list[LedgerRecord]:
-        """See `DeliveryLedger.list_for_tenant`. Newest first, same tie-break."""
-        rows = sorted(
-            (
-                record
-                for (row_tenant, _), record in self._rows.items()
-                if row_tenant == tenant
-            ),
-            key=lambda record: (record.created_at, record.dedup_key),
-            reverse=True,
-        )
-        if limit is not None:
-            rows = rows[: max(0, limit)]
-        return rows

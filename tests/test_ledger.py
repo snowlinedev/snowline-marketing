@@ -1,9 +1,5 @@
 """The delivery ledger (spec §4).
 
-DB-backed, so these ride `migrated_db` and skip cleanly when Postgres is
-unreachable — the ledger's whole job is a uniqueness guarantee held by the
-database, and an in-memory substitute would test the wrong thing entirely.
-
 What is pinned here is the write shape, because everything above it depends on
 exactly these properties: the first delivery of a key claims it, every later one
 finds it TAKEN AND UNCHANGED (so a row the minting layer already advanced to
@@ -12,6 +8,14 @@ the store — never the caller — namespaces every key ("p:"/"e:", which is wha
 makes the engine's reserved event-level shapes unforgeable), and the
 constraints that keep an audit row answerable are the database's rather than
 every future writer's.
+
+The contract tests run as ONE conformance suite over both stores (the
+`ledger_store` fixture): `DeliveryLedger` rides `migrated_db` and skips cleanly
+when Postgres is unreachable; `InMemoryDeliveryLedger` — spec §11's dry-run
+store — needs no database at all, which is its whole point. Running the same
+tests over both is what proves the dry-run's dedup behavior is the SAME as
+production's, not a lookalike. Cases only the real store can express (CHECK
+constraints, direct SQL, the read surface) stay DB-only below.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ VERSION_ID = "gv-7f3a91c4"
 KEY = f"{TENANT}:messaging-refresh:pm-evt-0000101"
 
 
-def _matched(ledger: DeliveryLedger, **overrides):
+def _matched(ledger, **overrides):
     values = {
         "tenant": TENANT,
         "dedup_key": KEY,
@@ -47,8 +51,25 @@ def _matched(ledger: DeliveryLedger, **overrides):
     return ledger.record(**values)
 
 
-def test_a_fresh_key_is_claimed(migrated_db):
-    write = _matched(DeliveryLedger())
+@pytest.fixture(params=["postgres", "memory"])
+def ledger_store(request):
+    """One delivery ledger per param: the real Postgres-backed store (riding
+    `migrated_db`, so the whole param skips cleanly when Postgres is
+    unreachable) or the in-memory dry-run store. The shared contract tests
+    take this fixture so both implementations answer the same questions with
+    the same code — the two stores cannot drift apart on the public surface a
+    dry-run's honesty depends on."""
+    if request.param == "postgres":
+        request.getfixturevalue("migrated_db")
+        return DeliveryLedger()
+    return InMemoryDeliveryLedger()
+
+
+# --- the store contract, run over BOTH stores ---------------------------------
+
+
+def test_a_fresh_key_is_claimed(ledger_store):
+    write = _matched(ledger_store)
     assert write.inserted
     # The record reports the STORED key: the caller's rendered key under the
     # store's policy-level namespace.
@@ -59,16 +80,143 @@ def test_a_fresh_key_is_claimed(migrated_db):
     assert write.record.created_at is not None
 
 
-def test_a_repeat_delivery_finds_the_key_taken(migrated_db):
-    ledger = DeliveryLedger()
-    first = _matched(ledger)
-    second = _matched(ledger)
+def test_a_repeat_delivery_finds_the_key_taken(ledger_store):
+    first = _matched(ledger_store)
+    second = _matched(ledger_store)
     assert first.inserted
     assert not second.inserted
     # The SAME row comes back — spec §4's "re-delivery returns the existing
     # result". `inserted` is the entitlement to act, and exactly one delivery
     # ever gets it.
     assert second.record == first.record
+
+
+def test_created_at_marks_the_first_convergence(ledger_store):
+    # Unlike the policy cache's `fetched_at`, this timestamp must NOT advance: it
+    # is what makes a re-delivery visible as a no-op rather than as fresh work.
+    first = _matched(ledger_store)
+    second = _matched(ledger_store)
+    assert second.record.created_at == first.record.created_at
+
+
+def test_the_same_key_under_two_tenants_is_two_rows(ledger_store):
+    # Tenant is a COLUMN of the key, not merely a rendered substring: a tenant
+    # may author a dedup template that omits {tenant}, and uniqueness on the
+    # rendered string alone would let one org read back another's row.
+    bare_key = "messaging-refresh:pm-evt-0000101"
+    mine = ledger_store.record(
+        tenant=TENANT,
+        dedup_key=bare_key,
+        policy_id="messaging-refresh",
+        event_id="pm-evt-0000101",
+        event_type="item_completed",
+        outcome=DeliveryOutcome.matched,
+        policy_version_id=VERSION_ID,
+    )
+    theirs = ledger_store.record(
+        tenant="snowlinedev",
+        dedup_key=bare_key,
+        policy_id="messaging-refresh",
+        event_id="pm-evt-0000101",
+        event_type="item_completed",
+        outcome=DeliveryOutcome.matched,
+        policy_version_id="gv-other",
+    )
+    assert mine.inserted and theirs.inserted
+    assert ledger_store.get(TENANT, f"p:{bare_key}").policy_version_id == VERSION_ID
+    assert (
+        ledger_store.get("snowlinedev", f"p:{bare_key}").policy_version_id == "gv-other"
+    )
+
+
+def test_get_misses_return_none(ledger_store):
+    assert ledger_store.get(TENANT, "never-written") is None
+
+
+def test_the_store_namespaces_policy_and_event_keys(ledger_store):
+    # The namespace is the STORE's, derived from whether the write names a
+    # policy — a caller renders keys but cannot choose which namespace they
+    # land in.
+    policy = _matched(ledger_store)
+    event = ledger_store.record(
+        tenant=TENANT,
+        dedup_key=f"{TENANT}:pm-evt-0000200:ignored",
+        event_id="pm-evt-0000200",
+        event_type="item_reopened",
+        outcome=DeliveryOutcome.ignored,
+        detail="no entry selects this event",
+    )
+    assert policy.record.dedup_key.startswith("p:")
+    assert event.record.dedup_key == f"e:{TENANT}:pm-evt-0000200:ignored"
+
+
+def test_a_forged_event_shape_cannot_reach_an_event_level_row(ledger_store):
+    # The unforgeability the namespace exists for: a tenant-authored template
+    # rendering the engine's reserved shape VERBATIM — even one that renders
+    # the "e:" prefix itself — is a policy-level write, lands under "p:", and
+    # neither collides with nor reads back the real event-level row.
+    reserved = f"{TENANT}:pm-evt-0000300:ignored"
+    event = ledger_store.record(
+        tenant=TENANT,
+        dedup_key=reserved,
+        event_id="pm-evt-0000300",
+        event_type="item_reopened",
+        outcome=DeliveryOutcome.ignored,
+        detail="the real event-level row",
+    )
+    for forged in (reserved, f"e:{reserved}"):
+        write = _matched(ledger_store, dedup_key=forged, event_id="pm-evt-0000300")
+        assert write.inserted  # a fresh row, not a read-back of the reserved one
+        assert write.record.dedup_key == f"p:{forged}"
+        assert write.record.outcome is DeliveryOutcome.matched
+    assert event.record.dedup_key == f"e:{reserved}"
+
+
+def test_record_refuses_an_event_level_outcome_naming_a_policy(ledger_store):
+    # The store-side half of the CHECK constraint tests below: loud and typed,
+    # before the database gets a chance to answer with a driver-shaped
+    # IntegrityError (and the in-memory store has no CHECK to fall back on).
+    with pytest.raises(ValueError, match="must not name a policy"):
+        ledger_store.record(
+            tenant=TENANT,
+            dedup_key=f"{TENANT}:pm-evt-0000400:ignored",
+            policy_id="some-policy",
+            event_id="pm-evt-0000400",
+            event_type="item_reopened",
+            outcome=DeliveryOutcome.ignored,
+        )
+
+
+def test_record_refuses_a_policy_level_outcome_without_a_policy(ledger_store):
+    with pytest.raises(ValueError, match="must name the policy"):
+        ledger_store.record(
+            tenant=TENANT,
+            dedup_key=f"{TENANT}:no-policy:pm-evt-0000401",
+            event_id="pm-evt-0000401",
+            event_type="item_completed",
+            outcome=DeliveryOutcome.matched,
+            policy_version_id=VERSION_ID,
+        )
+
+
+def test_event_level_rows_may_omit_policy_and_version(ledger_store):
+    # The other side of those two constraints: `ignored` and `quarantined` are
+    # facts about an EVENT, and inventing a policy id for them would put a
+    # rule's name on a decision it never made.
+    write = ledger_store.record(
+        tenant=TENANT,
+        dedup_key=f"{TENANT}:pm-evt-0000103:ignored",
+        event_id="pm-evt-0000103",
+        event_type="item_reopened",
+        outcome=DeliveryOutcome.ignored,
+        detail="tenant has no policy-set artifact",
+    )
+    assert write.inserted
+    assert write.record.policy_id is None
+    assert write.record.policy_version_id is None
+
+
+# --- DB-only: direct SQL, the read surface, the CHECK constraints -------------
 
 
 def test_a_repeat_delivery_never_overwrites_the_row(migrated_db):
@@ -94,115 +242,6 @@ def test_a_repeat_delivery_never_overwrites_the_row(migrated_db):
     assert repeat.record.outcome is DeliveryOutcome.created
     assert repeat.record.created_item_ref == "pm-item-42"
     assert repeat.record.detail == "matched in mode 'active'"
-
-
-def test_created_at_marks_the_first_convergence(migrated_db):
-    # Unlike the policy cache's `fetched_at`, this timestamp must NOT advance: it
-    # is what makes a re-delivery visible as a no-op rather than as fresh work.
-    ledger = DeliveryLedger()
-    first = _matched(ledger)
-    second = _matched(ledger)
-    assert second.record.created_at == first.record.created_at
-
-
-def test_the_same_key_under_two_tenants_is_two_rows(migrated_db):
-    # Tenant is a COLUMN of the key, not merely a rendered substring: a tenant
-    # may author a dedup template that omits {tenant}, and uniqueness on the
-    # rendered string alone would let one org read back another's row.
-    ledger = DeliveryLedger()
-    bare_key = "messaging-refresh:pm-evt-0000101"
-    mine = ledger.record(
-        tenant=TENANT,
-        dedup_key=bare_key,
-        policy_id="messaging-refresh",
-        event_id="pm-evt-0000101",
-        event_type="item_completed",
-        outcome=DeliveryOutcome.matched,
-        policy_version_id=VERSION_ID,
-    )
-    theirs = ledger.record(
-        tenant="snowlinedev",
-        dedup_key=bare_key,
-        policy_id="messaging-refresh",
-        event_id="pm-evt-0000101",
-        event_type="item_completed",
-        outcome=DeliveryOutcome.matched,
-        policy_version_id="gv-other",
-    )
-    assert mine.inserted and theirs.inserted
-    assert ledger.get(TENANT, f"p:{bare_key}").policy_version_id == VERSION_ID
-    assert ledger.get("snowlinedev", f"p:{bare_key}").policy_version_id == "gv-other"
-
-
-def test_get_misses_return_none(migrated_db):
-    assert DeliveryLedger().get(TENANT, "never-written") is None
-
-
-def test_the_store_namespaces_policy_and_event_keys(migrated_db):
-    # The namespace is the STORE's, derived from whether the write names a
-    # policy — a caller renders keys but cannot choose which namespace they
-    # land in.
-    ledger = DeliveryLedger()
-    policy = _matched(ledger)
-    event = ledger.record(
-        tenant=TENANT,
-        dedup_key=f"{TENANT}:pm-evt-0000200:ignored",
-        event_id="pm-evt-0000200",
-        event_type="item_reopened",
-        outcome=DeliveryOutcome.ignored,
-        detail="no entry selects this event",
-    )
-    assert policy.record.dedup_key.startswith("p:")
-    assert event.record.dedup_key == f"e:{TENANT}:pm-evt-0000200:ignored"
-
-
-def test_a_forged_event_shape_cannot_reach_an_event_level_row(migrated_db):
-    # The unforgeability the namespace exists for: a tenant-authored template
-    # rendering the engine's reserved shape VERBATIM — even one that renders
-    # the "e:" prefix itself — is a policy-level write, lands under "p:", and
-    # neither collides with nor reads back the real event-level row.
-    ledger = DeliveryLedger()
-    reserved = f"{TENANT}:pm-evt-0000300:ignored"
-    event = ledger.record(
-        tenant=TENANT,
-        dedup_key=reserved,
-        event_id="pm-evt-0000300",
-        event_type="item_reopened",
-        outcome=DeliveryOutcome.ignored,
-        detail="the real event-level row",
-    )
-    for forged in (reserved, f"e:{reserved}"):
-        write = _matched(ledger, dedup_key=forged, event_id="pm-evt-0000300")
-        assert write.inserted  # a fresh row, not a read-back of the reserved one
-        assert write.record.dedup_key == f"p:{forged}"
-        assert write.record.outcome is DeliveryOutcome.matched
-    assert event.record.dedup_key == f"e:{reserved}"
-
-
-def test_record_refuses_an_event_level_outcome_naming_a_policy(migrated_db):
-    # The store-side half of the CHECK below: loud and typed, before the
-    # database gets a chance to answer with a driver-shaped IntegrityError.
-    with pytest.raises(ValueError, match="must not name a policy"):
-        DeliveryLedger().record(
-            tenant=TENANT,
-            dedup_key=f"{TENANT}:pm-evt-0000400:ignored",
-            policy_id="some-policy",
-            event_id="pm-evt-0000400",
-            event_type="item_reopened",
-            outcome=DeliveryOutcome.ignored,
-        )
-
-
-def test_record_refuses_a_policy_level_outcome_without_a_policy(migrated_db):
-    with pytest.raises(ValueError, match="must name the policy"):
-        DeliveryLedger().record(
-            tenant=TENANT,
-            dedup_key=f"{TENANT}:no-policy:pm-evt-0000401",
-            event_id="pm-evt-0000401",
-            event_type="item_completed",
-            outcome=DeliveryOutcome.matched,
-            policy_version_id=VERSION_ID,
-        )
 
 
 def test_for_event_answers_what_happened_to_one_event(migrated_db):
@@ -360,24 +399,6 @@ def test_a_quarantined_row_must_explain_itself(migrated_db):
     )
 
 
-def test_event_level_rows_may_omit_policy_and_version(migrated_db):
-    # The other side of those two constraints: `ignored` and `quarantined` are
-    # facts about an EVENT, and inventing a policy id for them would put a
-    # rule's name on a decision it never made.
-    ledger = DeliveryLedger()
-    write = ledger.record(
-        tenant=TENANT,
-        dedup_key=f"{TENANT}:pm-evt-0000103:ignored",
-        event_id="pm-evt-0000103",
-        event_type="item_reopened",
-        outcome=DeliveryOutcome.ignored,
-        detail="tenant has no policy-set artifact",
-    )
-    assert write.inserted
-    assert write.record.policy_id is None
-    assert write.record.policy_version_id is None
-
-
 def test_failed_is_a_storable_outcome_for_later(migrated_db):
     # §11 (retry / dead-letter) is a later item, but the vocabulary is fixed
     # NOW: the value, its CHECK and the dashboard's filter set must not need a
@@ -395,38 +416,13 @@ def test_failed_is_a_storable_outcome_for_later(migrated_db):
     assert write.record.outcome is DeliveryOutcome.failed
 
 
-# --- InMemoryDeliveryLedger (spec §11's dry-run store) ------------------------
-#
-# No `migrated_db` here: the whole point of this store is not needing Postgres.
-# What is pinned is that it behaves IDENTICALLY to `DeliveryLedger` on every
-# property the engine's dry-run honesty depends on — first-insert-wins,
-# namespace derivation, the outcome<->policy_id guard — so these largely
-# mirror the DB-backed tests above with the store swapped out.
-
-
-def test_in_memory_a_fresh_key_is_claimed():
-    write = _matched(InMemoryDeliveryLedger())
-    assert write.inserted
-    assert write.record.dedup_key == f"p:{KEY}"
-    assert write.record.outcome is DeliveryOutcome.matched
-    assert write.record.created_item_ref is None
-    assert write.record.created_at is not None
-
-
-def test_in_memory_a_repeat_delivery_finds_the_key_taken():
-    ledger = InMemoryDeliveryLedger()
-    first = _matched(ledger)
-    second = _matched(ledger)
-    assert first.inserted
-    assert not second.inserted
-    assert second.record == first.record
+# --- in-memory-only: no SQL to advance a row with -----------------------------
 
 
 def test_in_memory_never_overwrites_the_row():
-    # The same "DO NOTHING, never DO UPDATE" contract: a matched row advanced
-    # to `created` (as the real ledger's `test_a_repeat_delivery_never_
-    # overwrites_the_row` does via a direct SQL update — this store has no
-    # SQL, so a direct dict write plays the same role) must survive a
+    # The same "DO NOTHING, never DO UPDATE" contract the DB test above pins
+    # via a direct SQL update — this store has no SQL, so a direct dict write
+    # plays the same role: a matched row advanced to `created` must survive a
     # re-delivery within the same run, the same way it does for the real
     # store.
     import dataclasses
@@ -441,120 +437,3 @@ def test_in_memory_never_overwrites_the_row():
     assert not repeat.inserted
     assert repeat.record.outcome is DeliveryOutcome.created
     assert repeat.record.created_item_ref == "pm-item-42"
-
-
-def test_in_memory_the_same_key_under_two_tenants_is_two_rows():
-    ledger = InMemoryDeliveryLedger()
-    bare_key = "messaging-refresh:pm-evt-0000101"
-    mine = ledger.record(
-        tenant=TENANT,
-        dedup_key=bare_key,
-        policy_id="messaging-refresh",
-        event_id="pm-evt-0000101",
-        event_type="item_completed",
-        outcome=DeliveryOutcome.matched,
-        policy_version_id=VERSION_ID,
-    )
-    theirs = ledger.record(
-        tenant="snowlinedev",
-        dedup_key=bare_key,
-        policy_id="messaging-refresh",
-        event_id="pm-evt-0000101",
-        event_type="item_completed",
-        outcome=DeliveryOutcome.matched,
-        policy_version_id="gv-other",
-    )
-    assert mine.inserted and theirs.inserted
-    assert ledger.get(TENANT, f"p:{bare_key}").policy_version_id == VERSION_ID
-    assert ledger.get("snowlinedev", f"p:{bare_key}").policy_version_id == "gv-other"
-
-
-def test_in_memory_get_misses_return_none():
-    assert InMemoryDeliveryLedger().get(TENANT, "never-written") is None
-
-
-def test_in_memory_namespaces_policy_and_event_keys():
-    ledger = InMemoryDeliveryLedger()
-    policy = _matched(ledger)
-    event = ledger.record(
-        tenant=TENANT,
-        dedup_key=f"{TENANT}:pm-evt-0000200:ignored",
-        event_id="pm-evt-0000200",
-        event_type="item_reopened",
-        outcome=DeliveryOutcome.ignored,
-        detail="no entry selects this event",
-    )
-    assert policy.record.dedup_key.startswith("p:")
-    assert event.record.dedup_key == f"e:{TENANT}:pm-evt-0000200:ignored"
-
-
-def test_in_memory_a_forged_event_shape_cannot_reach_an_event_level_row():
-    ledger = InMemoryDeliveryLedger()
-    reserved = f"{TENANT}:pm-evt-0000300:ignored"
-    event = ledger.record(
-        tenant=TENANT,
-        dedup_key=reserved,
-        event_id="pm-evt-0000300",
-        event_type="item_reopened",
-        outcome=DeliveryOutcome.ignored,
-        detail="the real event-level row",
-    )
-    for forged in (reserved, f"e:{reserved}"):
-        write = _matched(ledger, dedup_key=forged, event_id="pm-evt-0000300")
-        assert write.inserted
-        assert write.record.dedup_key == f"p:{forged}"
-    assert event.record.dedup_key == f"e:{reserved}"
-
-
-def test_in_memory_refuses_an_event_level_outcome_naming_a_policy():
-    with pytest.raises(ValueError, match="must not name a policy"):
-        InMemoryDeliveryLedger().record(
-            tenant=TENANT,
-            dedup_key=f"{TENANT}:pm-evt-0000400:ignored",
-            policy_id="some-policy",
-            event_id="pm-evt-0000400",
-            event_type="item_reopened",
-            outcome=DeliveryOutcome.ignored,
-        )
-
-
-def test_in_memory_refuses_a_policy_level_outcome_without_a_policy():
-    with pytest.raises(ValueError, match="must name the policy"):
-        InMemoryDeliveryLedger().record(
-            tenant=TENANT,
-            dedup_key=f"{TENANT}:no-policy:pm-evt-0000401",
-            event_id="pm-evt-0000401",
-            event_type="item_completed",
-            outcome=DeliveryOutcome.matched,
-            policy_version_id=VERSION_ID,
-        )
-
-
-def test_in_memory_for_event_and_list_for_tenant_mirror_the_real_store():
-    ledger = InMemoryDeliveryLedger()
-    for policy_id in ("policy-a", "policy-b"):
-        ledger.record(
-            tenant=TENANT,
-            dedup_key=f"{TENANT}:{policy_id}:pm-evt-0000110",
-            policy_id=policy_id,
-            event_id="pm-evt-0000110",
-            event_type="milestone_released",
-            outcome=DeliveryOutcome.matched,
-            policy_version_id=VERSION_ID,
-        )
-    ledger.record(
-        tenant="snowlinedev",
-        dedup_key="snowlinedev:policy:0",
-        policy_id="policy",
-        event_id="pm-evt-0",
-        event_type="item_completed",
-        outcome=DeliveryOutcome.matched,
-        policy_version_id="gv-other",
-    )
-    rows = ledger.for_event(TENANT, "pm-evt-0000110")
-    assert {r.policy_id for r in rows} == {"policy-a", "policy-b"}
-    assert ledger.for_event(TENANT, "nothing-like-this") == []
-    assert len(ledger.list_for_tenant(TENANT)) == 2
-    assert len(ledger.list_for_tenant(TENANT, limit=1)) == 1
-    assert len(ledger.list_for_tenant("snowlinedev")) == 1
-    assert ledger.list_for_tenant("nobody") == []

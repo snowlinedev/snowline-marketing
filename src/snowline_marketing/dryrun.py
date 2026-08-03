@@ -47,12 +47,13 @@ from snowline_marketing.engine import (
     Delivery,
     EvaluationHandler,
     EvaluationStalled,
+    PendingConsequence,
+    StallReason,
     resolve_policy_set,
 )
 from snowline_marketing.events import MalformedEnvelope
 from snowline_marketing.intake import HandlerFailure, run_intake
 from snowline_marketing.ledger import DeliveryOutcome, InMemoryDeliveryLedger
-from snowline_marketing.policies import ConsequenceType, PolicyDestination, PolicyMode
 from snowline_marketing.policy_cache import InMemoryPolicyCache
 from snowline_marketing.policy_source import InMemoryPolicyProvider
 from snowline_marketing.sources import FixturesEventSource
@@ -74,7 +75,10 @@ def _decode_candidate_body(policy_body: str | bytes | Mapping[str, Any]) -> str:
     A mapping is the operator's in-memory draft — round-tripped through
     `json.dumps` so it classifies through the exact same TEXT path
     `classify.decode_json_object` gives every other body, rather than a
-    second, divergent mapping-shaped path existing only for this caller.
+    second, divergent mapping-shaped path existing only for this caller. A
+    mapping holding a non-JSON value (a datetime, a set) raises
+    TypeError/ValueError out of `json.dumps`; `dry_run` catches that and
+    returns a stalled report carrying the real exception text.
     Bytes are a file read verbatim, decoded permissively: a body that fails to
     decode as UTF-8 is exactly the kind of broken draft `parse_policy_set` is
     built to quarantine as `not_json`, not a reason for this function to
@@ -82,86 +86,24 @@ def _decode_candidate_body(policy_body: str | bytes | Mapping[str, Any]) -> str:
     replacement characters land in a body that was already unparseable
     JSON."""
     if isinstance(policy_body, Mapping):
-        try:
-            return json.dumps(dict(policy_body))
-        except (TypeError, ValueError) as exc:
-            # A draft mapping holding a non-JSON value (a datetime, a set) is
-            # a BROKEN DRAFT, same class as undecodable bytes below — it must
-            # flow through to parse_policy_set and quarantine as not_json with
-            # a readable detail, never raise a traceback out of dry_run.
-            return f"<draft mapping is not JSON-serializable: {exc}>"
+        return json.dumps(dict(policy_body))
     if isinstance(policy_body, bytes):
         return policy_body.decode("utf-8", errors="replace")
     return policy_body
 
 
 @dataclass(frozen=True)
-class WouldMintSummary:
-    """What one matched delivery would have minted, had this not been a
-    dry-run — §11's headline question, answered.
-
-    Built from the SAME `engine.PendingConsequence` the live minting layer
-    (§7) would consume, never from a re-derivation, so this summary cannot
-    describe a mint the live path would not actually produce."""
-
-    policy_id: str
-    consequence: ConsequenceType
-    mode: PolicyMode
-    mints: bool
-    # The frozen model, whole — a flattened field-per-scalar copy would
-    # silently drop any destination field a later schema adds.
-    destination: PolicyDestination
-    title_template: str
-
-
-def _would_mint(delivery: Delivery) -> WouldMintSummary | None:
-    consequence = delivery.consequence
-    if consequence is None:
-        return None
-    return WouldMintSummary(
-        policy_id=consequence.policy_id,
-        consequence=consequence.consequence,
-        mode=consequence.mode,
-        mints=consequence.mints,
-        destination=consequence.destination,
-        title_template=consequence.entry.title_template,
-    )
-
-
-@dataclass(frozen=True)
-class DryRunDelivery:
-    """One event x one policy (or one event-level row) — mirrors
-    `engine.Delivery` field-for-field (the outcome, the STORED dedup key, the
-    operator detail) plus the would-mint summary for a match, so the report
-    cannot say anything evaluation itself did not decide."""
-
-    outcome: DeliveryOutcome
-    dedup_key: str
-    policy_id: str | None
-    detail: str | None
-    would_mint: WouldMintSummary | None
-
-
-def _delivery_report(delivery: Delivery) -> DryRunDelivery:
-    return DryRunDelivery(
-        outcome=delivery.outcome,
-        dedup_key=delivery.record.dedup_key,
-        policy_id=delivery.record.policy_id,
-        # The delivery's own detail (set only for the within-evaluation
-        # collision) when there is one; otherwise the ROW's detail — the
-        # match/ignore/quarantine reason an operator reads for this line.
-        detail=delivery.detail or delivery.record.detail,
-        would_mint=_would_mint(delivery),
-    )
-
-
-@dataclass(frozen=True)
 class DryRunEventResult:
-    """One evaluated event, in the order the capture delivered it."""
+    """One evaluated event, in the order the capture delivered it.
+
+    `deliveries` carries `engine.Delivery` — the frozen engine type, whole and
+    verbatim, never a field-by-field mirror that could fall behind the engine's
+    schema — so the report cannot say anything evaluation itself did not
+    decide."""
 
     event_id: str
     event_type: str
-    deliveries: tuple[DryRunDelivery, ...]
+    deliveries: tuple[Delivery, ...]
 
 
 @dataclass(frozen=True)
@@ -206,20 +148,36 @@ class DryRunReport:
         )
 
     @property
-    def would_mint(self) -> tuple[WouldMintSummary, ...]:
+    def would_mint(self) -> tuple[PendingConsequence, ...]:
         """Every consequence this preview says WOULD ACTUALLY MINT, in
         delivery order — the report's direct answer to §11's headline
-        question. Filtered on `mints`: a `dry_run`-mode policy's consequence
-        is evaluated and reported per delivery, but production would mint
+        question, carried as the SAME `engine.PendingConsequence` the live
+        minting layer (§7) would consume.
+
+        Filtered on `mints`: a `dry_run`-mode policy's consequence is
+        evaluated and reported per delivery, but production would mint
         nothing for it, and this headline must not overstate what a rollout
-        does. The per-delivery `would_mint` summaries keep every consequence,
-        mints flag visible, for the operator reading line by line."""
-        return tuple(
-            delivery.would_mint
-            for event in self.events
-            for delivery in event.deliveries
-            if delivery.would_mint is not None and delivery.would_mint.mints
-        )
+        does. The per-delivery consequences keep every consequence, mints
+        flag visible, for the operator reading line by line.
+
+        Deduplicated by the delivery's stored `record.dedup_key` (first
+        occurrence wins): a re-owed match — the same event re-delivered while
+        its mint never happened — shares its row's key and re-emits its
+        consequence per delivery (spec §4's recoverable convergence), but
+        production, with minting doing its job, mints ONCE per key, and so
+        must the headline."""
+        seen: set[str] = set()
+        consequences: list[PendingConsequence] = []
+        for event in self.events:
+            for delivery in event.deliveries:
+                consequence = delivery.consequence
+                if consequence is None or not consequence.mints:
+                    continue
+                if delivery.record.dedup_key in seen:
+                    continue
+                seen.add(delivery.record.dedup_key)
+                consequences.append(consequence)
+        return tuple(consequences)
 
 
 def dry_run(
@@ -245,20 +203,49 @@ def dry_run(
     `InMemoryDeliveryLedger`, `InMemoryCursorStore`. Nothing durable is
     touched.
 
-    Raises ValueError when `fixtures_dir` does not exist: a glob over a
-    typo'd path yields nothing, and a clean "0 deliveries" report over a
-    capture that was never read would be indistinguishable from a genuinely
+    Raises ValueError when `fixtures_dir` is not a capture directory —
+    distinguishing a path that does not exist from one that exists but is not
+    a directory (a fixture FILE passed where its directory belongs): a glob
+    over a typo'd path yields nothing, and a clean "0 deliveries" report over
+    a capture that was never read would be indistinguishable from a genuinely
     empty one — the wrong-path case must fail loudly, matching
     `sources.fixture_files`' posture toward broken captures."""
     directory = Path(fixtures_dir)
-    if not directory.is_dir():
+    if not directory.exists():
         raise ValueError(
             f"fixtures directory {str(directory)!r} does not exist — refusing "
             "to report a never-read capture as an empty one"
         )
+    if not directory.is_dir():
+        raise ValueError(
+            f"fixtures path {str(directory)!r} exists but is not a directory "
+            "— pass the capture DIRECTORY, not a fixture file"
+        )
+
+    try:
+        body = _decode_candidate_body(policy_body)
+    except (TypeError, ValueError) as exc:
+        # A draft mapping holding a non-JSON value (a datetime, a set) is a
+        # BROKEN DRAFT: it stalls the preview the way any quarantined
+        # candidate does — a real stalled report carrying the real exception
+        # text, never a traceback out of dry_run and never a sentinel body
+        # smuggled through the parser.
+        return DryRunReport(
+            tenant=tenant,
+            version_id=version_id,
+            stalled=EvaluationStalled(
+                tenant=tenant,
+                reason=StallReason.policy_quarantined,
+                detail=f"draft mapping is not JSON-serializable: {exc}",
+                version_id=version_id,
+            ),
+            pass_failure=None,
+            events=(),
+            malformed=(),
+        )
 
     provider = InMemoryPolicyProvider()
-    provider.put(tenant, version_id, _decode_candidate_body(policy_body))
+    provider.put(tenant, version_id, body)
     cache = InMemoryPolicyCache()
 
     # Classify the candidate EAGERLY, before any fixture is read — through the
@@ -277,11 +264,16 @@ def dry_run(
         )
 
     ledger = InMemoryDeliveryLedger()
+    # The eager resolution SEEDS the handler's per-pass memo: the pass
+    # evaluates against the very object the preview's stall verdict was
+    # decided on, so the two can never diverge — a candidate stall is fully
+    # handled by the eager path above.
     handler = EvaluationHandler(
         tenant,
         provider=provider,
         cache=cache,
         ledger=ledger,
+        resolution=resolution,
     )
     malformed: list[MalformedEnvelope] = []
     result = run_intake(
@@ -294,22 +286,18 @@ def dry_run(
         DryRunEventResult(
             event_id=evaluated.envelope.event_id,
             event_type=evaluated.envelope.event_type.value,
-            deliveries=tuple(_delivery_report(d) for d in evaluated.deliveries),
+            deliveries=evaluated.deliveries,
         )
         for evaluated in handler.results
     )
     return DryRunReport(
         tenant=tenant,
         version_id=version_id,
-        # The handler's stall would also surface as result.failure; check it
-        # first so a stall reports as a stall, not a generic pass failure.
-        # (Eager classification makes a candidate stall here unreachable in
-        # practice, but the handler seam keeps its own contract.)
-        stalled=handler.stall,
+        stalled=None,
         # The capture walk's own failure — a mixed-width capture, a file
         # deleted mid-pass — surfaced, never swallowed: a broken capture must
         # not read as "this policy matches nothing".
-        pass_failure=None if handler.stall is not None else result.failure,
+        pass_failure=result.failure,
         events=events,
         malformed=tuple(malformed),
     )
@@ -336,13 +324,14 @@ def render_text(report: DryRunReport) -> str:
             "only what was read before the failure"
         )
 
-    total = sum(report.counts.values())
+    counts = report.counts
+    total = sum(counts.values())
     lines.append(f"{total} deliveries evaluated:")
     for outcome in DeliveryOutcome:
-        count = report.counts.get(outcome, 0)
+        count = counts.get(outcome, 0)
         if count:
             lines.append(f"  {outcome.value}: {count}")
-    if not report.counts:
+    if not counts:
         lines.append("  (none)")
 
     if report.malformed:
@@ -357,20 +346,21 @@ def render_text(report: DryRunReport) -> str:
         lines.append(f"  {event.event_id} ({event.event_type}):")
         for delivery in event.deliveries:
             head = f"    {delivery.outcome.value}"
-            if delivery.policy_id:
-                head += f" [{delivery.policy_id}]"
-            head += f" dedup_key={delivery.dedup_key!r}"
+            if delivery.record.policy_id:
+                head += f" [{delivery.record.policy_id}]"
+            head += f" dedup_key={delivery.record.dedup_key!r}"
             lines.append(head)
-            wm = delivery.would_mint
-            if wm is not None:
-                destination = wm.destination.scope
-                if wm.destination.initiative:
-                    destination += f"/{wm.destination.initiative}"
-                if wm.destination.phase:
-                    destination += f"/{wm.destination.phase}"
+            consequence = delivery.consequence
+            if consequence is not None:
+                destination = consequence.destination.scope
+                if consequence.destination.initiative:
+                    destination += f"/{consequence.destination.initiative}"
+                if consequence.destination.phase:
+                    destination += f"/{consequence.destination.phase}"
                 lines.append(
-                    f"      would mint: {wm.consequence.value} "
-                    f"(mode={wm.mode.value}, mints={wm.mints}) -> {destination} "
-                    f'— "{wm.title_template}"'
+                    f"      would mint: {consequence.consequence.value} "
+                    f"(mode={consequence.mode.value}, "
+                    f"mints={consequence.mints}) -> {destination} "
+                    f'— "{consequence.entry.title_template}"'
                 )
     return "\n".join(lines)

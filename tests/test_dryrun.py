@@ -68,7 +68,7 @@ def test_would_mint_carries_the_full_consequence_summary():
     assert messaging.destination.scope == "turtlesedge/marketing"
     assert messaging.destination.initiative == "messaging"
     assert messaging.destination.phase is None
-    assert messaging.title_template
+    assert messaging.entry.title_template
 
 
 def test_a_dry_run_mode_policy_is_reported_as_not_minting():
@@ -79,10 +79,10 @@ def test_a_dry_run_mode_policy_is_reported_as_not_minting():
     # `approval_required` match IS owed work and stays in (spec §11 vs §12).
     report = dry_run(TURTLESEDGE_BODY, EVENT_FIXTURES_DIR, tenant=TENANT)
     per_delivery = [
-        d.would_mint
+        d.consequence
         for event in report.events
         for d in event.deliveries
-        if d.would_mint is not None
+        if d.consequence is not None
     ]
     snapshot = next(
         m for m in per_delivery if m.policy_id == "monthly-metrics-snapshot"
@@ -163,17 +163,15 @@ def test_a_tenant_mismatched_candidate_reports_stalled():
 def _duplicate_event_capture(tmp_path) -> None:
     """A tiny two-file capture, both files the SAME event — the "captured
     twice" scenario a flaky producer or a re-exported capture can produce."""
-    from snowline_marketing.events import SCHEMA_VERSION
+    from conftest import make_envelope
 
-    envelope = {
-        "schema_version": SCHEMA_VERSION,
-        "event_id": "pm-evt-dup-0001",
-        "event_type": "item_completed",
-        "tenant": TENANT,
-        "occurred_at": "2026-07-20T12:00:00+00:00",
-        "subject": {"kind": "work_item", "id": "dup-item"},
-        "payload": {"scope": "turtlesedge/turtletracks"},
-    }
+    from snowline_marketing.events import EventType
+
+    envelope = make_envelope(
+        EventType.item_completed,
+        event_id="pm-evt-dup-0001",
+        subject={"kind": "work_item", "id": "dup-item"},
+    )
     (tmp_path / "0010-first.json").write_text(json.dumps(envelope))
     (tmp_path / "0020-again.json").write_text(json.dumps(envelope))
 
@@ -214,7 +212,7 @@ def test_a_repeat_ignored_event_is_deduplicated_within_a_dry_run(tmp_path):
     first_delivery, second_delivery = (
         d for event in report.events for d in event.deliveries
     )
-    assert first_delivery.dedup_key == second_delivery.dedup_key
+    assert first_delivery.record.dedup_key == second_delivery.record.dedup_key
 
 
 def test_a_repeat_unminted_match_is_re_owed_not_deduplicated(tmp_path):
@@ -238,9 +236,23 @@ def test_a_repeat_unminted_match_is_re_owed_not_deduplicated(tmp_path):
     first_delivery, second_delivery = (
         d for event in report.events for d in event.deliveries
     )
-    assert first_delivery.dedup_key == second_delivery.dedup_key
-    assert first_delivery.would_mint is not None
-    assert second_delivery.would_mint is not None
+    assert first_delivery.record.dedup_key == second_delivery.record.dedup_key
+    assert first_delivery.consequence is not None
+    assert second_delivery.consequence is not None
+
+
+def test_a_re_owed_match_appears_once_in_the_would_mint_headline(tmp_path):
+    # The headline's dedup, pinned: the two matched deliveries above re-owe
+    # the SAME ledger row's mint (they share its dedup_key), and production,
+    # with minting doing its job, mints ONCE — so the §11 headline must list
+    # the consequence once, not twice, however many times the capture
+    # re-delivered the event.
+    _duplicate_event_capture(tmp_path)
+    report = dry_run(_MATCH_ALL_COMPLETED_BODY, tmp_path, tenant=TENANT)
+    assert report.ok
+    assert report.counts == {DeliveryOutcome.matched: 2}
+    (would_mint,) = report.would_mint
+    assert would_mint.policy_id == "review-on-completion"
 
 
 # --- no trace ------------------------------------------------------------------
@@ -313,6 +325,15 @@ def test_a_missing_fixtures_directory_is_refused(tmp_path):
         dry_run(TURTLESEDGE_BODY, tmp_path / "no-such-capture", tenant=TENANT)
 
 
+def test_a_fixtures_path_that_is_a_file_is_refused_distinctly(tmp_path):
+    # A fixture FILE passed where its directory belongs is a different mistake
+    # from a typo'd path, and the message must say which one was made.
+    fixture = tmp_path / "0001-event.json"
+    fixture.write_text("{}")
+    with pytest.raises(ValueError, match="exists but is not a directory"):
+        dry_run(TURTLESEDGE_BODY, fixture, tenant=TENANT)
+
+
 def test_an_unserializable_draft_mapping_stalls_instead_of_raising(tmp_path):
     import datetime
 
@@ -323,9 +344,11 @@ def test_an_unserializable_draft_mapping_stalls_instead_of_raising(tmp_path):
     )
     assert not report.ok
     assert report.stalled is not None
-    assert "not-JSON-serializable" in report.stalled.detail or "not_json" in str(
-        report.stalled.detail
-    )
+    assert report.stalled.reason is StallReason.policy_quarantined
+    # The REAL exception text rides through — json.dumps's TypeError names the
+    # offending type, which is what the operator needs to fix the draft.
+    assert "not JSON-serializable" in report.stalled.detail
+    assert "datetime" in report.stalled.detail
 
 
 def test_counts_are_derived_from_events():

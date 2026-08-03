@@ -733,12 +733,18 @@ class EvaluationHandler:
         provider: PolicyProvider,
         cache: PolicyCacheStore | None = None,
         ledger: LedgerStore | None = None,
+        resolution: PolicyResolution | None = None,
     ) -> None:
+        # `resolution` pre-seeds the per-pass memo: §11's dry-run classifies
+        # the candidate eagerly (a broken draft must stall even against an
+        # empty capture) and seeds the pass with that SAME resolution, so the
+        # preview's stall verdict and the pass's evaluation can never diverge.
+        # Live callers omit it and the memo fills lazily on first use.
         self.tenant = tenant
         self._provider = provider
         self._cache = cache if cache is not None else PolicyCache()
         self._ledger = ledger if ledger is not None else DeliveryLedger()
-        self._resolution: PolicyResolution | None = None
+        self._resolution: PolicyResolution | None = resolution
         self.results: list[EvaluationResult] = []
         # The stall this pass ended on, if any — the same object the exception
         # carries, kept so a driver that caught the pass's `IntakeResult`
