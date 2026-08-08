@@ -40,6 +40,18 @@ audit fact — how this version classified when it was fetched, which is what
 §11's dashboard lists and what an operator's timeline needs — while the engine
 always evaluates against today's parser. When a schema fix ships, a re-fetch
 re-classifies; nothing has to be migrated, and no stale parse silently governs.
+
+`PolicyCacheStore` is the protocol `engine.resolve_policy_set` actually
+depends on — `put`, the only method it calls. `InMemoryPolicyCache` is the
+second implementation: held in the process rather than Postgres, so spec
+§11's dry-run can classify a candidate policy body through the exact same
+`parse_policy_set` call production makes without writing a row to
+`policy_cache`. It shares `PolicyCache.put`'s classification via `_classify`
+and mirrors its tenant-guarded upsert (see "The upsert is guarded on TENANT,
+not on content" above), because that guard is precisely the one a dry-run
+must not weaken — the whole point of testing a candidate against captured
+fixtures is that the classification it reports is the one production would
+give the same body.
 """
 
 from __future__ import annotations
@@ -47,7 +59,8 @@ from __future__ import annotations
 import enum
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -108,6 +121,70 @@ class CachedPolicyVersion:
         )
 
 
+def _classify(
+    resolved: ResolvedPolicySet,
+) -> tuple[ParsedPolicySet, ParseOutcome, str | None, str | None]:
+    """Parse and classify one resolved body — the (outcome, reason, detail)
+    triple both `PolicyCache.put` and `InMemoryPolicyCache.put` persist.
+
+    Shared for the reason `_namespaced_key` is shared in `ledger.py`: the
+    classification is the one thing a dry-run's quarantine verdict must not
+    disagree with production about, so it exists in exactly one place rather
+    than two calls to `parse_policy_set` that could drift in what they pass
+    it. Reason/detail are `None` on the valid path — enforced downstream by
+    `ck_policy_cache_quarantine_reason` for the real store; a leftover reason
+    from an earlier classification would make a healthy policy read as broken
+    on the operator surface."""
+    parsed = parse_policy_set(
+        resolved.body,
+        ref=resolved.artifact_id,
+        version_id=resolved.version_id,
+        expected_tenant=resolved.tenant,
+    )
+    if isinstance(parsed, MalformedPolicySet):
+        return parsed, ParseOutcome.quarantined, parsed.reason.value, parsed.detail
+    return parsed, ParseOutcome.valid, None, None
+
+
+def _collision_refusal(
+    version_id: str, holder_tenant: str | None, tenant: str, body: str
+) -> MalformedPolicySet:
+    """The refusal both stores hand back when a caller-chosen version id
+    collides across tenants (module docstring: "The upsert is guarded on
+    TENANT, not on content").
+
+    Shared for the reason `_classify` is: the refusal's shape — reason
+    `version_collision`, a detail naming the version id and BOTH tenants (the
+    row's holder and the requester), the row left unchanged — is precisely the
+    behavior a dry-run must not weaken, so it exists in exactly one place
+    rather than two hand-copied constructions that could drift."""
+    return MalformedPolicySet(
+        reason=MalformedPolicyReason.version_collision,
+        detail=(
+            f"version id {version_id!r} is already cached for "
+            f"tenant {holder_tenant!r}; refused for tenant {tenant!r} — "
+            "the row is unchanged and the audit join is broken "
+            "until the collision is resolved"
+        ),
+        raw=body,
+        version_id=version_id,
+        tenant=tenant,
+    )
+
+
+class PolicyCacheStore(Protocol):
+    """What `engine.resolve_policy_set` needs from a policy cache — `put`,
+    and nothing else it ever calls.
+
+    `PolicyCache` (Postgres) and `InMemoryPolicyCache` (spec §11's dry-run)
+    both satisfy this without inheriting from it — the engine takes the
+    protocol so a dry-run can classify a candidate policy body without a row
+    ever landing in `policy_cache`, and `engine.py` never has to import, or
+    know about, the dry-run at all."""
+
+    def put(self, resolved: ResolvedPolicySet) -> ParsedPolicySet: ...
+
+
 class PolicyCache:
     """The `policy_cache` table (spec §4).
 
@@ -122,13 +199,14 @@ class PolicyCache:
         """Cache one resolved version, classifying it HERE.
 
         Takes the `ResolvedPolicySet` straight from the provider and runs
-        `parse_policy_set` itself — with `expected_tenant` set from the
-        resolution, so a body declaring a different tenant quarantines as
-        `tenant_mismatch` instead of caching one tenant's rules under
-        another's name. Parsing inside `put` (and returning the result for
-        the caller to evaluate) is what makes the row's classification
-        UNABLE to disagree with its body: there is no API through which a
-        caller can hand in a parsed result derived from something else.
+        `parse_policy_set` itself (via `_classify`) — with `expected_tenant`
+        set from the resolution, so a body declaring a different tenant
+        quarantines as `tenant_mismatch` instead of caching one tenant's
+        rules under another's name. Parsing inside `put` (and returning the
+        result for the caller to evaluate) is what makes the row's
+        classification UNABLE to disagree with its body: there is no API
+        through which a caller can hand in a parsed result derived from
+        something else.
 
         When the tenant-guarded upsert REFUSES the write (the version id is
         already another tenant's row), the parsed set is NOT returned even if
@@ -139,24 +217,7 @@ class PolicyCache:
         version_id = resolved.version_id
         tenant = resolved.tenant
         body = resolved.body
-        parsed = parse_policy_set(
-            body,
-            ref=resolved.artifact_id,
-            version_id=version_id,
-            expected_tenant=tenant,
-        )
-        if isinstance(parsed, MalformedPolicySet):
-            outcome = ParseOutcome.quarantined
-            reason: str | None = parsed.reason.value
-            detail: str | None = parsed.detail
-        else:
-            outcome = ParseOutcome.valid
-            # NULL on the valid path, enforced by
-            # `ck_policy_cache_quarantine_reason`: a leftover reason from an
-            # earlier classification would make a healthy policy read as broken
-            # on the operator surface.
-            reason = None
-            detail = None
+        parsed, outcome, reason, detail = _classify(resolved)
         log_ = logging.getLogger("snowline_marketing.policy_cache")
         statement = pg_insert(CachedPolicySetRow).values(
             version_id=version_id,
@@ -218,18 +279,7 @@ class PolicyCache:
                     version_id,
                     tenant,
                 )
-                return MalformedPolicySet(
-                    reason=MalformedPolicyReason.version_collision,
-                    detail=(
-                        f"version id {version_id!r} is already cached for "
-                        f"tenant {holder!r}; refused for tenant {tenant!r} — "
-                        "the row is unchanged and the audit join is broken "
-                        "until the collision is resolved"
-                    ),
-                    raw=body,
-                    version_id=version_id,
-                    tenant=tenant,
-                )
+                return _collision_refusal(version_id, holder, tenant, body)
         return parsed
 
     def get(self, version_id: str) -> CachedPolicyVersion | None:
@@ -266,3 +316,56 @@ def _to_record(row: CachedPolicySetRow) -> CachedPolicyVersion:
         quarantine_reason=row.quarantine_reason,
         quarantine_detail=row.quarantine_detail,
     )
+
+
+class InMemoryPolicyCache:
+    """A policy cache held in the process — spec §11's dry-run cache.
+
+    Not a mock: `put` runs the exact same `_classify` (therefore the exact
+    same `parse_policy_set` call, tenant cross-check included) that
+    `PolicyCache.put` does, so a candidate body's verdict — valid, or
+    quarantined with a reason — is the one production would give it. What
+    differs is only where the row lands: a dict, never `policy_cache`.
+
+    Mirrors the real store's TENANT-GUARDED upsert (module docstring: "The
+    upsert is guarded on TENANT, not on content"), because that guard exists
+    precisely for the caller-chosen ids this store's only caller uses — two
+    dry-runs (or a dry-run and a fixture-driven test) reusing a readable
+    version id like `pv-0001` must not let the second silently steal the row
+    out from under the first tenant's listing. A cross-tenant collision is
+    therefore REFUSED here too (a `version_collision` `MalformedPolicySet`,
+    row unchanged), never absorbed — same outcome shape as `PolicyCache.put`,
+    minus the logged warning (there is no operator-facing log for a process
+    that exits with the dry-run).
+
+    Satisfies `PolicyCacheStore`, which is all `resolve_policy_set` requires;
+    `get` mirrors `PolicyCache.get` for symmetry and for tests that want to
+    assert on what a dry-run classified without re-deriving it."""
+
+    def __init__(self) -> None:
+        self._rows: dict[str, CachedPolicyVersion] = {}
+
+    def put(self, resolved: ResolvedPolicySet) -> ParsedPolicySet:
+        """See `PolicyCacheStore.put` / `PolicyCache.put`."""
+        parsed, outcome, reason, detail = _classify(resolved)
+        existing = self._rows.get(resolved.version_id)
+        if existing is not None and existing.tenant != resolved.tenant:
+            # The tenant-guarded refusal (see class docstring): the row
+            # belongs to another tenant, so this put does not touch it.
+            return _collision_refusal(
+                resolved.version_id, existing.tenant, resolved.tenant, resolved.body
+            )
+        self._rows[resolved.version_id] = CachedPolicyVersion(
+            version_id=resolved.version_id,
+            tenant=resolved.tenant,
+            body=resolved.body,
+            outcome=outcome,
+            fetched_at=datetime.now(timezone.utc),
+            quarantine_reason=reason,
+            quarantine_detail=detail,
+        )
+        return parsed
+
+    def get(self, version_id: str) -> CachedPolicyVersion | None:
+        """See `PolicyCache.get`."""
+        return self._rows.get(version_id)
