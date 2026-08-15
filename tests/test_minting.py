@@ -2,18 +2,22 @@
 
 Driven over the SHIPPED capture and the SHIPPED policy artifact through
 `run_intake_and_mint`, which is the same composition a scheduled driver will
-call: intake pass, then mint what it owed. The sink is
-`InMemoryWorkItemSink` — PM does not run, and the properties under test do not
-need it to, because every one of them is a property of the LEDGER's convergence:
+call: minting runs PER EVENT inside the intake handler, BEFORE the ack (the
+§4 convergence spine, `minting.py`). The sink is `InMemoryWorkItemSink` — PM
+does not run, and the properties under test do not need it to, because every
+one of them is a property of the LEDGER's convergence:
 
 - §14's headline, restated for minting: duplicate delivery of the same event
   creates exactly ONE item, across repeated passes.
 - The crash window is closed. A mint that succeeded with its confirmation lost
-  must not re-mint on re-delivery, and must not vanish either — it surfaces.
+  must not re-mint on re-delivery, and must not vanish either — it dedups
+  quietly while the claim is fresh and surfaces once it goes stale.
 - A dry-run match closes and stops re-owing; an approval-gated match neither
-  mints, nor spams, nor is lost.
-- A permanent refusal dead-letters with its reason; a transient one re-owes and
-  mints on recovery; an ambiguous one holds its claim.
+  mints, nor spams, nor is lost — and drains the moment its mode is revised
+  to active.
+- A permanent refusal dead-letters with its reason; a transient one stops the
+  pass with the event UN-ACKED and mints exactly once on recovery; an
+  ambiguous one holds its claim.
 
 The convergence tests run over BOTH ledger stores (the `minting_ledger`
 fixture), for the reason `test_ledger.py` gives: the in-memory store is what a
@@ -23,12 +27,17 @@ Postgres would prove it for half the code paths that rely on it.
 
 from __future__ import annotations
 
+import dataclasses
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
+import sqlalchemy as sa
 from conftest import EVENT_FIXTURES_DIR, POLICY_FIXTURES_DIR, TENANT
 
+from snowline_marketing import config
 from snowline_marketing.cursors import InMemoryCursorStore
+from snowline_marketing.db import session_scope
 from snowline_marketing.engine import EvaluationResult, evaluate, resolve_policy_set
 from snowline_marketing.events import EventEnvelope, parse_envelope
 from snowline_marketing.ledger import (
@@ -42,6 +51,7 @@ from snowline_marketing.minting import (
     mint_pass,
     run_intake_and_mint,
 )
+from snowline_marketing.models import DeliveryLedgerEntry as DeliveryLedgerRow
 from snowline_marketing.policy_cache import InMemoryPolicyCache
 from snowline_marketing.policy_source import InMemoryPolicyProvider
 from snowline_marketing.rendering import PROVENANCE_HEADING
@@ -129,6 +139,28 @@ def re_deliver(envelope, resolution, ledger) -> EvaluationResult:
     result = evaluate(envelope, resolution, ledger=ledger)
     assert isinstance(result, EvaluationResult)
     return result
+
+
+def age_claim(ledger, dedup_key: str) -> None:
+    """Back-date a claim past MARKETING_CLAIM_STALE_SECONDS on whichever store
+    the param gave us — the passage of time, injected, so the stale branch is
+    testable without sleeping."""
+    old = datetime.now(timezone.utc) - timedelta(
+        seconds=config.claim_stale_seconds() + 60
+    )
+    if isinstance(ledger, InMemoryDeliveryLedger):
+        record = ledger.get(TENANT, dedup_key)
+        ledger._rows[(TENANT, dedup_key)] = dataclasses.replace(record, updated_at=old)
+        return
+    with session_scope() as session:
+        session.execute(
+            sa.update(DeliveryLedgerRow)
+            .where(
+                DeliveryLedgerRow.tenant == TENANT,
+                DeliveryLedgerRow.dedup_key == dedup_key,
+            )
+            .values(updated_at=old)
+        )
 
 
 class LosesConfirmations:
@@ -236,6 +268,58 @@ def test_approval_required_rows_neither_mint_nor_spam_nor_vanish(minting_ledger)
         assert minting_ledger.get(TENANT, outcome.dedup_key) == row
 
 
+def _one_policy_body(mode: str) -> str:
+    """One policy, parameterized by mode — the artifact pair a mode revision
+    produces (same entry, gated then armed)."""
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "tenant": TENANT,
+            "policies": [
+                {
+                    "policy_id": "gate-then-arm",
+                    "event_types": ["item_completed"],
+                    "consequence": "messaging_refresh",
+                    "mode": mode,
+                    "destination": {"scope": "turtlesedge/marketing"},
+                    "title_template": "Refresh",
+                    "body_template": "Body.",
+                    "dedup_key_template": "{tenant}:{policy_id}:{event_id}",
+                }
+            ],
+        }
+    )
+
+
+def test_a_mode_revised_to_active_drains_the_gated_row(minting_ledger):
+    # The queue actually drains: a row parked at `awaiting_approval` is
+    # claimable (the ledger's claim accepts it), and the mode gate lives in
+    # the MINTING layer — so a still-gated policy never mints, while the same
+    # event re-delivered under an ACTIVE revision of the entry mints exactly
+    # once and the row converges to `created`.
+    envelope, _resolution, gated = one_consequence(
+        minting_ledger, body=_one_policy_body("approval_required")
+    )
+    sink = InMemoryWorkItemSink()
+    parked = mint_consequence(gated, sink=sink, ledger=minting_ledger)
+    assert parked.disposition is MintDisposition.awaiting_approval
+    assert sink.requests == []
+
+    armed = InMemoryPolicyProvider()
+    armed.put(TENANT, "gv-armed", _one_policy_body("active"))
+    resolution = resolve_policy_set(TENANT, provider=armed, cache=InMemoryPolicyCache())
+    result = re_deliver(envelope, resolution, minting_ledger)
+    # The gated row still owes its work, and the consequence carries the
+    # CURRENT (active) entry.
+    (re_owed,) = result.consequences
+    outcome = mint_consequence(re_owed, sink=sink, ledger=minting_ledger)
+    assert outcome.disposition is MintDisposition.created
+    assert len(sink.requests) == 1
+    row = minting_ledger.get(TENANT, gated.dedup_key)
+    assert row.outcome is DeliveryOutcome.created
+    assert row.created_item_ref == outcome.item_ref
+
+
 # --- the crash window --------------------------------------------------------
 
 
@@ -252,9 +336,21 @@ def test_a_lost_confirmation_neither_re_mints_nor_disappears(minting_ledger):
     assert row.outcome is DeliveryOutcome.claimed
     assert row.created_item_ref is None
 
-    # Re-delivery: the engine refuses to re-own a claimed row. No consequence
-    # (so nothing can re-mint), a `failed` DELIVERY (so nothing is silent), and
-    # the row untouched (so §11 can reconcile it against PM).
+    # Re-delivery while the claim is FRESH: as far as any other pass can tell,
+    # the crashed one still owns the row mid-mint — quiet deduplication, no
+    # consequence, so nothing can re-mint.
+    fresh = re_deliver(envelope, resolution, minting_ledger)
+    assert fresh.outcomes == (DeliveryOutcome.deduplicated,)
+    assert fresh.consequences == ()
+    assert fresh.deliveries[0].detail == (
+        "claim in flight — another pass owns this mint"
+    )
+
+    # Once the claim goes STALE, the engine refuses to re-own it: still no
+    # consequence (so nothing can re-mint), but now a `failed` DELIVERY (so
+    # nothing is silent), and the row untouched (so §11 can reconcile it
+    # against PM).
+    age_claim(minting_ledger, consequence.dedup_key)
     result = re_deliver(envelope, resolution, minting_ledger)
     assert result.outcomes == (DeliveryOutcome.failed,)
     assert result.consequences == ()
@@ -324,27 +420,45 @@ def test_a_permanent_rejection_dead_letters_with_its_reason(minting_ledger):
     assert row.created_item_ref is None
 
 
-def test_a_transient_failure_re_owes_and_mints_on_recovery(minting_ledger):
-    envelope, resolution, consequence = one_consequence(minting_ledger)
+def test_pm_down_during_a_pass_leaves_the_event_unacked_and_mints_on_recovery(
+    minting_ledger,
+):
+    """The §4 convergence spine, driven through the REAL composition: minting
+    happens inside the intake handler BEFORE the ack, so PM being down stops
+    the pass with the event UN-ACKED and the claim already released — and the
+    next pass, with PM up, re-delivers from the same cursor and mints exactly
+    once."""
+    cursor_store = InMemoryCursorStore()
     down = InMemoryWorkItemSink(lambda request: SinkUnavailable(detail="PM restarting"))
-    deferred = mint_consequence(consequence, sink=down, ledger=minting_ledger)
-    assert deferred.disposition is MintDisposition.deferred
+    first = drive(minting_ledger, down, cursor_store=cursor_store)
+    assert not first.intake.ok
+    assert "MintingUnavailableError" in first.intake.failure.error
+    assert first.unavailable is not None
+    assert first.unavailable.disposition is MintDisposition.deferred
     # Not an operator's problem: re-delivery IS the retry loop.
-    assert not deferred.needs_operator
-    row = minting_ledger.get(TENANT, consequence.dedup_key)
+    assert not first.unavailable.needs_operator
+    # The event was never acked — the capture's first minting event stopped
+    # the pass before anything moved the cursor past it.
+    assert first.intake.acked_position is None
+    assert first.intake.delivered == 0
+    # The claim is already released: the row re-owes its mint.
+    row = minting_ledger.get(TENANT, first.unavailable.dedup_key)
     assert row.outcome is DeliveryOutcome.matched
     assert "re-owes" in row.detail
+    assert len(down.requests) == 1  # one attempt, no in-pass retry loop
 
-    # The next pass re-delivers the event, the engine re-owes the consequence,
-    # and a recovered PM mints it.
-    result = re_deliver(envelope, resolution, minting_ledger)
-    assert result.outcomes == (DeliveryOutcome.matched,)
+    # Next pass, SAME cursor, PM recovered: the un-acked event re-delivers,
+    # the engine re-owes the consequence, and everything mints exactly once.
     up = InMemoryWorkItemSink()
-    report = mint_pass(result.consequences, sink=up, ledger=minting_ledger)
-    (outcome,) = report.outcomes
-    assert outcome.disposition is MintDisposition.created
-    assert minting_ledger.get(TENANT, consequence.dedup_key).created_item_ref
-    assert len(down.requests) == 1 and len(up.requests) == 1
+    second = drive(minting_ledger, up, cursor_store=cursor_store)
+    assert second.intake.ok
+    assert second.mint.counts[MintDisposition.created] == EXPECTED_MINTS
+    assert len(up.requests) == EXPECTED_MINTS
+    assert len(set(up.dedup_keys)) == len(up.dedup_keys)
+    assert up.dedup_keys.count(first.unavailable.dedup_key) == 1
+    row = minting_ledger.get(TENANT, first.unavailable.dedup_key)
+    assert row.outcome is DeliveryOutcome.created
+    assert row.created_item_ref
 
 
 def test_an_ambiguous_answer_holds_the_claim(minting_ledger):
@@ -361,9 +475,15 @@ def test_an_ambiguous_answer_holds_the_claim(minting_ledger):
     row = minting_ledger.get(TENANT, consequence.dedup_key)
     assert row.outcome is DeliveryOutcome.claimed
 
-    result = re_deliver(envelope, resolution, minting_ledger)
-    assert result.consequences == ()
-    assert result.outcomes == (DeliveryOutcome.failed,)
+    # Fresh, the held claim dedups quietly; stale, it surfaces. Neither
+    # re-owes: the mint may have happened, and re-minting would duplicate.
+    fresh = re_deliver(envelope, resolution, minting_ledger)
+    assert fresh.consequences == ()
+    assert fresh.outcomes == (DeliveryOutcome.deduplicated,)
+    age_claim(minting_ledger, consequence.dedup_key)
+    stale = re_deliver(envelope, resolution, minting_ledger)
+    assert stale.consequences == ()
+    assert stale.outcomes == (DeliveryOutcome.failed,)
 
 
 # --- rendering failures are per delivery -------------------------------------

@@ -25,6 +25,7 @@ from snowline_marketing.policies import (
     PolicyMode,
 )
 from snowline_marketing.rendering import (
+    NEUTRALIZED_PROVENANCE_HEADING,
     PROVENANCE_HEADING,
     TEMPLATE_FIELD_NAMES,
     RenderFailure,
@@ -219,6 +220,67 @@ def test_a_nested_placeholder_in_a_format_spec_is_refused():
     assert "nested placeholder" in result.detail
 
 
+def test_an_oversized_format_spec_width_is_refused_before_it_allocates():
+    # A spec's width IS a memory allocation — format() builds the whole padded
+    # string — and the spec is tenant-authored text, so an absurd width must
+    # fail as a template bug rather than be attempted.
+    result = failure(entry=entry(title_template="{scope:>999999999}"))
+    assert "memory allocation" in result.detail
+    assert "1000" in result.detail
+
+
+def test_a_format_spec_width_at_the_limit_still_renders():
+    # The guard caps the NUMBER, not legitimate alignment: 1000 itself is fine
+    # (on the body, whose output cap comfortably exceeds it).
+    request = rendered(
+        entry=entry(
+            title_template="t",
+            body_template="{scope:>1000}",
+        ),
+        envelope=envelope(details={"title": "t"}),
+    )
+    body, _, _block = request.body.partition(PROVENANCE_HEADING)
+    assert SCOPE in body
+
+
+def test_a_memory_error_during_format_fails_the_delivery_not_the_pass():
+    # Defence in depth behind the spec-width guard: whatever raises MemoryError
+    # inside format() must fail ONE delivery, never kill the pass.
+    class ExplodingText(str):
+        def __format__(self, spec: str) -> str:
+            raise MemoryError("allocation refused")
+
+    result = failure(envelope=envelope(details={"title": ExplodingText("x")}))
+    assert "MemoryError" in result.detail
+
+
+def test_a_rendered_title_over_the_cap_fails_the_delivery():
+    # A runaway template must not post megabytes to PM: each rendered output
+    # has a hard cap, and exceeding it is a per-delivery failure naming the
+    # field and the cap.
+    result = failure(envelope=envelope(details={"title": "x" * 600}))
+    assert "title_template" in result.detail
+    assert "500" in result.detail
+
+
+def test_a_rendered_body_over_the_cap_fails_the_delivery():
+    result = failure(
+        entry=entry(title_template="t", body_template="{details.blob}"),
+        envelope=envelope(details={"title": "t", "blob": "x" * 70000}),
+    )
+    assert "body_template" in result.detail
+    assert "65536" in result.detail
+
+
+def test_a_rendered_owner_over_the_cap_fails_the_delivery():
+    result = failure(
+        entry=entry(title_template="t", owner_template="{details.owner}"),
+        envelope=envelope(details={"title": "t", "owner": "x" * 300}),
+    )
+    assert "owner_template" in result.detail
+    assert "200" in result.detail
+
+
 def test_a_template_cannot_traverse_into_plugin_objects():
     # The reason rendering is exact-name lookup instead of `str.format`: a
     # tenant-authored string must never resolve an attribute on a Python object
@@ -313,6 +375,31 @@ def test_an_absent_optional_fact_is_omitted_rather_than_printed_empty():
     block = provenance_block(consequence())
     assert "source milestone" not in block
     assert "source scope" in block
+
+
+def test_a_forged_provenance_block_is_visibly_escaped():
+    # The rendered body is tenant/producer-authored text, so a `details` value
+    # carrying a full forged block would otherwise read exactly like the real
+    # one. Neutralization makes the invariant simple: the un-escaped heading
+    # appears exactly ONCE per minted body — on the genuine, appended block —
+    # and that is the block readers and the §8 sweep may trust.
+    forged = (
+        f"{PROVENANCE_HEADING}\n"
+        "- matched policy: attacker-policy\n"
+        "- delivery ledger key: p:turtlesedge:attacker:pm-evt-9"
+    )
+    request = rendered(
+        entry=entry(title_template="t", body_template="{details.title}"),
+        envelope=envelope(details={"title": forged}),
+    )
+    assert request.body.count(PROVENANCE_HEADING) == 1
+    assert NEUTRALIZED_PROVENANCE_HEADING in request.body
+    # The escaped forgery sits ABOVE the one authentic heading.
+    assert request.body.index(NEUTRALIZED_PROVENANCE_HEADING) < (
+        request.body.index(PROVENANCE_HEADING)
+    )
+    # The forged lines survive, visibly marked — nothing is silently dropped.
+    assert "attacker-policy" in request.body
 
 
 # --- the request the sink receives -------------------------------------------

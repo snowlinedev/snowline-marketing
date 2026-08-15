@@ -343,6 +343,56 @@ def test_closing_a_dry_run_row_is_terminal(ledger_store):
     assert ledger_store.get(TENANT, STORED_KEY).outcome is DeliveryOutcome.dry_run
 
 
+def test_a_claim_takes_an_awaiting_approval_row_too(ledger_store):
+    # The mode gate is the MINTING layer's (it claims only for a current
+    # `active` entry), so the ledger's claim accepts a gated row: a policy
+    # revised from `approval_required` to `active` drains its queued rows on
+    # re-delivery instead of stranding them.
+    _matched(ledger_store)
+    ledger_store.mark_awaiting_approval(TENANT, STORED_KEY, detail="gated")
+    transition = ledger_store.claim(TENANT, STORED_KEY, detail="mode now active")
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.claimed
+
+
+def test_replay_is_the_declared_exit_from_a_dead_letter(ledger_store):
+    # §11's replay verb hook: failed -> matched, deliberate and operator-only
+    # (nothing auto-invokes it). The reopened row re-owes and is claimable, so
+    # the replayed mint can actually run.
+    _claimed(ledger_store)
+    ledger_store.mark_failed(TENANT, STORED_KEY, detail="PM rejected: no such scope")
+    transition = ledger_store.replay(
+        TENANT, STORED_KEY, detail="replayed after the artifact was revised"
+    )
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.matched
+    assert transition.record.created_item_ref is None
+    assert ledger_store.claim(TENANT, STORED_KEY).applied
+    # Guarded: replay means "reopen a dead letter" and nothing else.
+    refused = ledger_store.replay(TENANT, STORED_KEY, detail="again")
+    assert not refused.applied
+
+
+def test_release_stale_claim_is_the_declared_exit_from_a_claim(ledger_store):
+    # The reconciliation verb for a claim an operator verified never-sent (or
+    # resolved PM-side): claimed -> matched, guarded, never auto-invoked.
+    _claimed(ledger_store)
+    transition = ledger_store.release_stale_claim(
+        TENANT, STORED_KEY, detail="operator verified the request never arrived"
+    )
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.matched
+    assert "never arrived" in transition.record.detail
+    # Compare-and-set: a row that is not claimed refuses...
+    assert not ledger_store.release_stale_claim(TENANT, STORED_KEY, detail="x").applied
+    # ...and a CONFIRMED row can never be released into a re-mint.
+    ledger_store.claim(TENANT, STORED_KEY)
+    ledger_store.confirm_created(TENANT, STORED_KEY, item_ref="pm-item-42")
+    refused = ledger_store.release_stale_claim(TENANT, STORED_KEY, detail="x")
+    assert not refused.applied
+    assert refused.record.outcome is DeliveryOutcome.created
+
+
 def test_a_transition_on_a_row_that_does_not_exist_reports_neither(ledger_store):
     transition = ledger_store.claim(TENANT, "p:never-recorded")
     assert not transition.applied
@@ -576,6 +626,32 @@ def test_in_memory_never_overwrites_the_row():
     assert not repeat.inserted
     assert repeat.record.outcome is DeliveryOutcome.created
     assert repeat.record.created_item_ref == "pm-item-42"
+
+
+def test_the_in_memory_clock_is_injectable():
+    # The stale-vs-live claim distinction (`engine.evaluate`) is a fact about
+    # `updated_at`'s AGE, so the dry-run store takes a clock a test controls —
+    # the in-process analogue of the real store's server-side now().
+    from datetime import datetime, timezone
+
+    frozen = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ledger = InMemoryDeliveryLedger(clock=lambda: frozen)
+    write = _matched(ledger)
+    assert write.record.created_at == frozen
+    claim = ledger.claim(TENANT, STORED_KEY, detail="mint in flight")
+    assert claim.record.updated_at == frozen
+
+
+def test_the_outcome_vocabulary_is_declared_once():
+    # The import-time pin's other half, visible in the suite: the app enum and
+    # the schema CHECK are both built from models.DELIVERY_OUTCOME_VALUES, so
+    # a value cannot be admitted on one side and dropped on the other. (The
+    # migrations keep deliberate literal copies — history does not grow.)
+    from snowline_marketing import models
+
+    assert {outcome.value for outcome in DeliveryOutcome} == (
+        models.DELIVERY_OUTCOME_VALUES
+    )
 
 
 def test_two_passes_racing_one_claim_resolve_in_the_database(migrated_db):

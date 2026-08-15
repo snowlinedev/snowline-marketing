@@ -47,6 +47,12 @@ Env vars:
                              platform. Shared (unprefixed) across plugins,
                              like SNOWLINE_PLATFORM_URL — one deploy knob
                              tunes every plugin's cadence.
+  MARKETING_CLAIM_STALE_SECONDS — how old a delivery-ledger CLAIM must be
+                             before a re-delivery treats it as abandoned
+                             rather than in flight (the engine's stale-vs-live
+                             distinction; see `engine.evaluate`). Fresh claims
+                             dedup quietly; stale ones surface for §11's
+                             reconciliation.
   MARKETING_ENABLED        — off by default (spec §2: "Off by default").
                              When unset or falsy, the intake and evaluation
                              loops (later phases) must not do anything; the
@@ -90,6 +96,13 @@ DEFAULT_BIND_PORT = 8805
 # Registration heartbeat cadence — matches the platform's health-poll default,
 # so a platform restart heals in roughly one health round.
 DEFAULT_REGISTRATION_HEARTBEAT_SECONDS = 15.0
+
+# How old a held ledger claim must be before a re-delivery stops treating it
+# as another pass's in-flight mint and surfaces it for reconciliation. 15
+# minutes: comfortably longer than any single mint round trip (the sink's
+# timeout is 10s), short enough that a crashed pass's orphan is visible within
+# the operator's working hour rather than a day later.
+DEFAULT_CLAIM_STALE_SECONDS = 900.0
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -153,6 +166,39 @@ def marketing_enabled() -> bool:
     value. Tests pin this off via an autouse fixture (pattern:
     SNOWLINE_SHADOW_TURNS_ENABLED)."""
     return os.environ.get("MARKETING_ENABLED", "").strip().lower() in _TRUTHY
+
+
+def claim_stale_seconds() -> float:
+    """The stale-claim threshold (see `engine.evaluate`). LENIENT on a
+    malformed/absurd value (warn + fall back), same posture as the heartbeat
+    knob: this threshold shapes whether a re-delivery stays quiet or pages an
+    operator, and a typo in it must not turn every in-flight claim into a
+    reconciliation alarm (zero/negative) or hide every orphaned one forever
+    (nan/inf)."""
+    raw = os.environ.get("MARKETING_CLAIM_STALE_SECONDS")
+    if raw is None:
+        return DEFAULT_CLAIM_STALE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "malformed MARKETING_CLAIM_STALE_SECONDS=%r — using the default %ss",
+            raw,
+            DEFAULT_CLAIM_STALE_SECONDS,
+        )
+        return DEFAULT_CLAIM_STALE_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        # "inf" would hide an orphaned claim forever; zero/negative would call
+        # every claim stale the instant it was written, turning the quiet
+        # in-flight path into a reconciliation alarm per delivery. Both are
+        # typos, not policies.
+        logging.getLogger(__name__).warning(
+            "out-of-range MARKETING_CLAIM_STALE_SECONDS=%r — using the default %ss",
+            raw,
+            DEFAULT_CLAIM_STALE_SECONDS,
+        )
+        return DEFAULT_CLAIM_STALE_SECONDS
+    return value
 
 
 def registration_heartbeat_seconds() -> float:

@@ -59,12 +59,18 @@ artifact version, source scope/initiative/phase/milestone, external refs,
 affected artifacts/channels/deliverable classes, the dispatch intent, and the
 delivery ledger key. Machine-greppable `label: value` lines, but written for the
 person who opens the roadmap item — a minted item is read by people, and a JSON
-blob in a work-item body is a thing people scroll past.
+blob in a work-item body is a thing people scroll past. And because the
+rendered body ABOVE the block is tenant/producer-authored text, any occurrence
+of the provenance heading inside it is neutralized before the genuine block is
+appended (`NEUTRALIZED_PROVENANCE_HEADING`): the un-escaped heading appears
+exactly once per minted body, on the block this plugin wrote, which is the
+invariant readers and the §8 sweep get to trust.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import string
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -91,6 +97,27 @@ _CONVERSIONS: dict[str, Callable[[str], str]] = {
     "s": str,
     "r": repr,
     "a": ascii,
+}
+
+# The largest number a format spec may carry (width, padding, precision). A
+# spec's width is a MEMORY ALLOCATION — `format("x", ">999999999")` builds the
+# whole padded string before any output cap could see it — and the spec is
+# tenant-authored text, so an unbounded width is a tenant choosing an
+# allocation inside the minting pass. 1000 comfortably exceeds any legitimate
+# alignment and stays far under anything that could hurt.
+_MAX_FORMAT_SPEC_NUMBER = 1000
+_FORMAT_SPEC_NUMBERS = re.compile(r"\d+")
+
+# Hard caps on each rendered template's OUTPUT, checked before the request is
+# built: a runaway template (a template quoting a huge `details` value, or a
+# producer that started sending one) must not post megabytes to PM. Exceeding
+# a cap is a per-delivery RenderFailure naming the field and the cap — the
+# same posture as every other template problem, because the fix is the same
+# operator's (revise the template, or the producer's payload).
+_OUTPUT_CAPS = {
+    "title_template": 500,
+    "body_template": 65536,
+    "owner_template": 200,
 }
 
 
@@ -264,6 +291,19 @@ def render_template(template: str, values: dict[str, str]) -> str:
                 f"placeholder {name!r} uses unknown conversion {conversion!r} "
                 "(only !s, !r, !a exist)"
             )
+        if format_spec and any(
+            int(number) > _MAX_FORMAT_SPEC_NUMBER
+            for number in _FORMAT_SPEC_NUMBERS.findall(format_spec)
+        ):
+            # Refused BEFORE format() runs: the width/padding number in a spec
+            # is an allocation (see _MAX_FORMAT_SPEC_NUMBER), so an oversized
+            # one must fail as a template bug rather than be attempted.
+            raise _Unrenderable(
+                f"placeholder {name!r} has a format spec {format_spec!r} whose "
+                f"width/precision exceeds {_MAX_FORMAT_SPEC_NUMBER} — a spec's "
+                "width is a memory allocation, and a tenant-authored one is "
+                "capped"
+            )
         value = values.get(name)
         if value is None:
             missing.append(name)
@@ -272,12 +312,15 @@ def render_template(template: str, values: dict[str, str]) -> str:
             value = _CONVERSIONS[conversion](value)
         try:
             out.append(format(value, format_spec or ""))
-        except ValueError as exc:
-            # A numeric/date format spec on a string value — every value in the
-            # vocabulary is text, so this is a template bug, per delivery.
+        except (ValueError, MemoryError) as exc:
+            # ValueError: a numeric/date format spec on a string value — every
+            # value in the vocabulary is text, so this is a template bug, per
+            # delivery. MemoryError: an allocation the spec guard above did not
+            # foresee — the pass must fail ONE delivery, never die; caught here
+            # while nothing is held so the recovery is trivial.
             raise _Unrenderable(
                 f"placeholder {name!r} has a format spec {format_spec!r} that "
-                f"does not apply to text ({exc})"
+                f"could not be applied to text ({type(exc).__name__}: {exc})"
             ) from exc
     if missing:
         raise _Unrenderable(
@@ -292,6 +335,17 @@ def render_template(template: str, values: dict[str, str]) -> str:
 # The heading that opens every minted item's provenance block. A constant
 # because it is what an operator (and, later, a §8 provenance sweep) greps for.
 PROVENANCE_HEADING = "— Snowline marketing provenance —"
+
+# What a TEMPLATE-DERIVED occurrence of that heading is rewritten to before
+# the genuine block is appended. Template output is tenant/producer-authored
+# text (`details` values above all), so a `details` value carrying a forged
+# provenance block would otherwise land in the body verbatim and read exactly
+# like the real one. Every occurrence inside the rendered body is replaced
+# with this variant — visibly marked, and NOT containing the exact heading
+# string (the em-dashes become tildes), so the ONLY un-escaped heading in a
+# minted body is the appended genuine block. Readers, and the §8 provenance
+# sweep, may therefore trust the LAST (equivalently: only) un-escaped block.
+NEUTRALIZED_PROVENANCE_HEADING = "(escaped) ~ Snowline marketing provenance ~"
 
 
 def _provenance_lines(consequence: PendingConsequence) -> list[str]:
@@ -401,10 +455,22 @@ def render_mint_request(consequence: PendingConsequence) -> MintRequest | Render
         if template is None:
             continue
         try:
-            rendered[field_name] = render_template(template, values)
+            text = render_template(template, values)
         except _Unrenderable as exc:
             problems.append(f"{field_name}: {exc.detail}")
             missing.update(exc.missing)
+            continue
+        cap = _OUTPUT_CAPS[field_name]
+        if len(text) > cap:
+            # A runaway output is a template problem like any other: fail THIS
+            # delivery, name the field and the cap, and let the rest of the
+            # pass mint (see _OUTPUT_CAPS).
+            problems.append(
+                f"{field_name}: rendered to {len(text)} characters, over the "
+                f"{cap}-character cap"
+            )
+            continue
+        rendered[field_name] = text
     if problems:
         return RenderFailure(
             policy_id=entry.policy_id,
@@ -416,6 +482,13 @@ def render_mint_request(consequence: PendingConsequence) -> MintRequest | Render
             ),
             missing=tuple(sorted(missing)),
         )
+    # Neutralize any forged heading BEFORE appending the genuine block (see
+    # NEUTRALIZED_PROVENANCE_HEADING): the rendered body is template-derived
+    # text, and the one invariant a reader gets is that the un-escaped heading
+    # appears exactly once, on the block this plugin wrote.
+    body_text = rendered["body_template"].replace(
+        PROVENANCE_HEADING, NEUTRALIZED_PROVENANCE_HEADING
+    )
     return MintRequest(
         tenant=consequence.tenant,
         scope=entry.destination.scope,
@@ -425,7 +498,7 @@ def render_mint_request(consequence: PendingConsequence) -> MintRequest | Render
         # The provenance block is appended REGARDLESS of the template (spec §7:
         # "every minted item body carries provenance"), separated by a blank
         # line so the policy's own words stay the first thing read.
-        body=f"{rendered['body_template']}\n\n{provenance_block(consequence)}",
+        body=f"{body_text}\n\n{provenance_block(consequence)}",
         human_owned=entry.human_owned,
         musher_dispatch=entry.musher_dispatch,
         owner=rendered.get("owner_template"),

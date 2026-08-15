@@ -94,7 +94,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from snowline_marketing import classify, config
+from snowline_marketing import classify, config, thin_client
 
 log = logging.getLogger("snowline_marketing.work_sink")
 
@@ -131,9 +131,18 @@ _PERMANENT_STATUSES = frozenset(
 # rather than caught as a base class, because the default has to be the
 # conservative one: a new httpx error type nobody classified must land on
 # "hold the claim", never on "re-mint".
+#
+# Placement verified against httpx 0.28.1's hierarchy: `ConnectError`
+# (NetworkError) and `ConnectTimeout` (TimeoutException) are both raised while
+# ESTABLISHING the connection, and `PoolTimeout` (TimeoutException) is raised
+# while WAITING for a connection from the pool — in all three cases no request
+# was written, so re-owing cannot duplicate. `ReadTimeout`/`WriteTimeout`
+# share `PoolTimeout`'s base class and are deliberately NOT here: they fire
+# after (or during) the send.
 _NEVER_SENT_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
+    httpx.PoolTimeout,
     httpx.UnsupportedProtocol,
     httpx.InvalidURL,
     httpx.LocalProtocolError,
@@ -454,15 +463,20 @@ class PMWorkItemSink:
             # refuses this destination" and "this ROUTE does not exist on this
             # PM build" share a status code, and the route is the assumed part
             # of this client. So the contract requires a real rejection to
-            # identify itself by naming the scope it refused; a bare framework
-            # 404 is transient, which fails visibly (nothing mints, rows re-owe)
-            # instead of dead-lettering every mint in the fleet.
-            payload, _decode_failure = classify.decode_json_object(response.content)
-            if payload is not None and payload.get("primary_scope") == request.scope:
+            # identify itself by naming the scope it refused
+            # (`thin_client.identified_404`, the discipline both thin clients
+            # share); a bare framework 404 is transient, which fails visibly
+            # (nothing mints, rows re-owe) instead of dead-lettering every
+            # mint in the fleet.
+            if thin_client.identified_404(response, "primary_scope", request.scope):
+                # Decoded again only for the refusal's own words — the shared
+                # helper answers the yes/no, and the body is small.
+                payload, _decode_failure = classify.decode_json_object(response.content)
+                detail = payload.get("detail") if payload is not None else None
                 return SinkRejected(
                     reason=(
                         f"PM rejected destination scope {request.scope!r}: "
-                        f"{payload.get('detail') or 'not found'}"
+                        f"{detail or 'not found'}"
                     ),
                     status_code=response.status_code,
                 )

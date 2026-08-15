@@ -226,6 +226,18 @@ def test_a_connect_failure_never_reached_pm_and_is_transient():
     assert "ConnectError" in result.detail
 
 
+def test_a_pool_timeout_never_sent_anything_and_is_transient():
+    # PoolTimeout fires while WAITING for a connection from the pool (verified
+    # against httpx 0.28.1's hierarchy) — no request was written, so it is the
+    # provably-never-sent case: release the claim, re-owe, try next pass.
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("pool exhausted", request=req)
+
+    result = _sink(handler).submit(request())
+    assert isinstance(result, SinkUnavailable)
+    assert "PoolTimeout" in result.detail
+
+
 def test_a_read_timeout_is_indeterminate_because_the_request_was_sent():
     def handler(req: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=req)

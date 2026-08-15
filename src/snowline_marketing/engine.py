@@ -40,7 +40,11 @@ still in the source; the next pass re-delivers it; when the provider recovers
 the same event evaluates normally. That is the whole recovery story, and it
 works because it composes with the ledger's unique key: re-delivery is safe
 because the existing row says how far the work got, and the delivery answers
-accordingly (spec §4, "recoverably convergent").
+accordingly (spec §4, "recoverably convergent"). The live composition extends
+the same shape one seam further: `minting.MintingEvaluationHandler` mints each
+event's consequences before returning, so "the handler returned" — and hence
+the ack — also means "the mint settled or parked", with its own typed raise
+(`MintingUnavailableError`) when PM was unreachable.
 
 **Recoverable convergence, spelled out.** For a matched entry the ledger row
 and the mint are two separate durable steps, so a crash can land between them:
@@ -63,14 +67,20 @@ reads the three sets `ledger.py` declares rather than testing outcomes by hand:
 - `RE_OWED_OUTCOMES` (`matched`, `awaiting_approval`) with no item ref — the
   work is still owed, so the delivery re-emits the consequence. The gated case
   is deliberate: an approval-gated match re-offers its consequence on every
-  re-delivery, and the minting pass declines to mint it every time, which is
-  what "waiting" has to look like when nobody is holding it in memory.
-- `RECONCILIATION_OUTCOMES` (`claimed`, `failed`) — a row an OPERATOR resolves.
-  A claimed row's mint may have succeeded with its confirmation lost, so
-  re-minting would duplicate and reporting `deduplicated` would assert work
-  that may not exist; a failed row was permanently refused and §11's replay
-  owns it. Both report a DELIVERY-level `failed` with a detail and write
-  nothing.
+  re-delivery, and the minting pass declines to mint it for as long as the
+  CURRENT entry's mode stays gated — which is what "waiting" has to look like
+  when nobody is holding it in memory. The consequence carries the current
+  entry, so a mode revised to `active` drains the queued row on the next
+  re-delivery (the ledger's claim transition accepts `awaiting_approval`).
+- `RECONCILIATION_OUTCOMES` (`claimed`, `failed`) — never re-minted, and what
+  the delivery reports depends on which. A FRESH claim (`updated_at` within
+  `config.claim_stale_seconds()`) is another pass's mint in flight — minting
+  runs inside the intake handler now, so overlap with a re-delivery is
+  ordinary — and dedups quietly, with no warning. A STALE claim's mint may
+  have succeeded with its confirmation lost, so re-minting would duplicate
+  and reporting `deduplicated` would assert work that may not exist; a failed
+  row was permanently refused and §11's replay owns it. Those two report a
+  DELIVERY-level `failed` with a detail and write nothing.
 - Everything else settled (`created`, `dry_run`) answers `deduplicated`. A
   `dry_run` row is settled precisely because a dry-run match produced no work
   on purpose — the one outcome where "nothing exists" and "nothing is owed" are
@@ -93,7 +103,9 @@ import enum
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
+from snowline_marketing import config
 from snowline_marketing.events import EventEnvelope
 from snowline_marketing.ledger import (
     RE_OWED_OUTCOMES,
@@ -287,10 +299,11 @@ class Delivery:
     Two outcomes live here and they are not the same question. `outcome` is what
     THIS delivery decided — `matched` when it claimed the key (or found it
     claimed but the work still owed — see the module docstring's recoverable
-    convergence), `deduplicated` when the key's row is settled, `failed` when a
-    within-evaluation key collision refused the delivery or the row needs
-    operator reconciliation, `ignored`/`quarantined` for the event-level rows on
-    their first delivery. `record.outcome` is what the ROW says, which on a
+    convergence), `deduplicated` when the key's row is settled or a fresh
+    claim is mid-mint, `failed` when a within-evaluation key collision refused
+    the delivery or the row needs operator reconciliation,
+    `ignored`/`quarantined` for the event-level rows on their first delivery.
+    `record.outcome` is what the ROW says, which on a
     repeat delivery is whatever the earlier one left there — possibly `created`,
     with a PM item ref beside it. They coincide on a fresh delivery and diverge
     on every repeat, and both are worth having: the first answers "what did this
@@ -303,9 +316,10 @@ class Delivery:
     mints once.
 
     `detail` is the operator-facing note for the deliveries whose outcome alone
-    does not explain itself: the within-evaluation key collision, and the
-    re-delivery that landed on a `claimed`/`failed` row. Distinct from
-    `record.detail`, which belongs to the ROW — neither of those deliveries
+    does not explain itself: the within-evaluation key collision, the
+    re-delivery that landed on a stale-`claimed`/`failed` row, and the quiet
+    `deduplicated` on a FRESH claim ("claim in flight"). Distinct from
+    `record.detail`, which belongs to the ROW — none of those deliveries
     writes one."""
 
     outcome: DeliveryOutcome
@@ -495,6 +509,19 @@ def render_dedup_key(entry: PolicyEntry, envelope: EventEnvelope) -> str:
     return entry.dedup_key_template.format(**values)
 
 
+def _claim_is_fresh(record: LedgerRecord) -> bool:
+    """Whether a `claimed` row is young enough to be another pass's mint in
+    flight — the stale-vs-live distinction the repeat-delivery handling turns
+    on. `updated_at` is stamped by the claim transition itself (both stores),
+    so its age IS the claim's age; a claimed row with no `updated_at` can only
+    be an out-of-band write and is treated as stale, which errs on the visible
+    side. The threshold is `config.claim_stale_seconds()` (default 900s)."""
+    if record.updated_at is None:
+        return False
+    age = datetime.now(timezone.utc) - record.updated_at
+    return age.total_seconds() < config.claim_stale_seconds()
+
+
 def evaluate(
     envelope: EventEnvelope,
     resolution: PolicyResolution,
@@ -680,19 +707,49 @@ def evaluate(
         )
         record = write.record
         re_owed = record.outcome in RE_OWED_OUTCOMES and record.created_item_ref is None
-        if not write.inserted and record.outcome in RECONCILIATION_OUTCOMES:
+        if (
+            not write.inserted
+            and record.outcome is DeliveryOutcome.claimed
+            and _claim_is_fresh(record)
+        ):
+            # A FRESH claim is not an operator's problem — it is another pass
+            # (or this event's own earlier consequence handling, minting
+            # per event before the ack) mid-mint RIGHT NOW. Minting runs
+            # inside the intake handler, so an event whose mint is in flight
+            # can be re-delivered seconds later; paging an operator for every
+            # such overlap would teach them to ignore the reconciliation
+            # queue. The delivery dedups quietly (DEBUG at most), emits no
+            # consequence, and writes nothing; if the claim's owner crashed,
+            # the claim ages past `config.claim_stale_seconds()` and the next
+            # re-delivery takes the loud branch below.
+            logging.getLogger("snowline_marketing.engine").debug(
+                "delivery for tenant %r found a fresh claim in flight: "
+                "policy %r, event %r, key %r",
+                tenant,
+                entry.policy_id,
+                envelope.event_id,
+                record.dedup_key,
+            )
+            delivery = Delivery(
+                outcome=DeliveryOutcome.deduplicated,
+                record=record,
+                detail="claim in flight — another pass owns this mint",
+            )
+        elif not write.inserted and record.outcome in RECONCILIATION_OUTCOMES:
             # The row is one an OPERATOR has to resolve, not one this pass may
             # act on (`ledger.RECONCILIATION_OUTCOMES`). Two shapes, one rule:
             #
-            # - `claimed` — a minting pass wrote the claim, called PM, and its
-            #   confirmation never landed. The mint may have happened. Emitting
-            #   a consequence would re-mint it, and reporting `deduplicated`
+            # - `claimed`, STALE — a minting pass wrote the claim, called PM,
+            #   and its confirmation never landed (a fresh claim took the
+            #   quiet branch above; one older than the stale threshold has no
+            #   live owner). The mint may have happened. Emitting a
+            #   consequence would re-mint it, and reporting `deduplicated`
             #   would assert work exists that may not. Both are silent; the
             #   spec forbids both, so the delivery says `failed` out loud and
-            #   §11's reconciliation owns the row.
+            #   §11's reconciliation (`release_stale_claim`) owns the row.
             # - `failed` — PM permanently refused this mint (or its templates
             #   would not render). Retrying on the accident of a re-delivery
-            #   would defeat the point of a dead-letter; §11's replay is the
+            #   would defeat the point of a dead-letter; §11's `replay` is the
             #   verb for it.
             #
             # The ledger is NOT touched: the row already says what it says, and

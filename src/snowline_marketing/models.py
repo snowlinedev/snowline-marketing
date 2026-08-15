@@ -28,6 +28,35 @@ class Base(DeclarativeBase):
     pass
 
 
+# The canonical delivery-outcome vocabulary — declared ONCE, here, because the
+# schema's CHECK constraint below is built from it and `ledger.DeliveryOutcome`
+# is pinned against it at import time. Two hand-maintained copies of this list
+# would drift exactly the way the pin exists to prevent: a value added to the
+# app enum but not the CHECK would be a row Postgres refuses, and one added to
+# the CHECK but not the enum would be a row `ledger._to_record` cannot read
+# back. The MIGRATIONS deliberately keep their own literal copies — a migration
+# describes the schema as of ITS revision, and a shared constant that grows
+# later would silently rewrite history (see 2f6c40a91d84).
+DELIVERY_OUTCOME_VALUES = frozenset(
+    {
+        "matched",
+        "ignored",
+        "claimed",
+        "created",
+        "awaiting_approval",
+        "dry_run",
+        "deduplicated",
+        "quarantined",
+        "failed",
+    }
+)
+
+# The CHECK expression, derived (sorted, so the rendered SQL is deterministic).
+_DELIVERY_OUTCOME_CHECK = (
+    "outcome IN (" + ", ".join(f"'{v}'" for v in sorted(DELIVERY_OUTCOME_VALUES)) + ")"
+)
+
+
 class ConsumerCursor(Base):
     """How far one event source has been consumed (spec §4)."""
 
@@ -293,9 +322,7 @@ class DeliveryLedgerEntry(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "outcome IN ('matched', 'ignored', 'claimed', 'created', "
-            "'awaiting_approval', 'dry_run', 'deduplicated', 'quarantined', "
-            "'failed')",
+            _DELIVERY_OUTCOME_CHECK,
             name="ck_delivery_ledger_outcome",
         ),
         # Both directions: policy-level outcomes must name the rule that

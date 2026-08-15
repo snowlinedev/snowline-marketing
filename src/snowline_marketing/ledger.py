@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
@@ -97,6 +98,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from snowline_marketing.db import session_scope
+from snowline_marketing.models import DELIVERY_OUTCOME_VALUES
 from snowline_marketing.models import DeliveryLedgerEntry as DeliveryLedgerRow
 
 
@@ -119,8 +121,12 @@ class DeliveryOutcome(enum.StrEnum):
       (spec §7). Written BEFORE the sink call, which is what makes it a durable
       single-writer guard rather than a status light: a claimed row whose
       confirmation never landed may or may not have minted, so re-delivery must
-      NOT re-mint it — it surfaces for reconciliation (§11). Not terminal, and
-      the only outcome an operator is ever expected to resolve by hand.
+      NOT re-mint it. A FRESH claim (`updated_at` within
+      `config.claim_stale_seconds()`) is treated as another pass's mint in
+      flight and dedups quietly; only a STALE one surfaces for reconciliation
+      (§11) — `engine.evaluate` reads `updated_at` to tell them apart. Not
+      terminal, and the only outcome an operator is ever expected to resolve
+      by hand (`release_stale_claim` is the declared verb).
     - `created` — the minting layer turned a `claimed` row into a PM item and
       wrote its ref (spec §7), in the one UPDATE
       `ck_delivery_ledger_created_item_ref` permits. Terminal.
@@ -130,6 +136,10 @@ class DeliveryOutcome(enum.StrEnum):
       stays re-owable (see `RE_OWED_OUTCOMES`) so the consequence keeps being
       re-emitted on re-delivery, and re-marking an already-marked row is a
       guarded no-op, which is what keeps "waiting" from becoming "spamming".
+      Claimable too (`claim` accepts it): the minting layer claims only when
+      the CURRENT entry's mode is `active`, so a still-gated policy never
+      mints, while a mode revised to `active` drains the queued rows on the
+      next re-delivery instead of stranding them.
     - `dry_run` — the entry matched in mode `dry_run`. TERMINAL, and terminal is
       the whole point: a dry-run match produced no work ON PURPOSE (§11:
       "report what would have been minted, mint nothing"), so leaving it at
@@ -146,11 +156,12 @@ class DeliveryOutcome(enum.StrEnum):
       dropped.
     - `failed` — the consequence could not be carried out and retrying will not
       help: PM permanently rejected the mint, or the entry's title/body template
-      could not be rendered from this event. Terminal here and the input to
-      §11's dead-letter/replay, which owns the operator verbs. The engine also
-      reports `failed` on a DELIVERY — without writing a row — for a
-      within-evaluation dedup-key collision and for a re-delivery that lands on
-      a row needing reconciliation (`engine.evaluate`).
+      could not be rendered from this event. The input to §11's dead-letter/
+      replay, and terminal to every AUTOMATIC path — only the declared `replay`
+      verb (§11's operator hook, never auto-invoked) takes a row back out. The
+      engine also reports `failed` on a DELIVERY — without writing a row — for
+      a within-evaluation dedup-key collision and for a re-delivery that lands
+      on a row needing reconciliation (`engine.evaluate`).
     """
 
     matched = "matched"
@@ -162,6 +173,19 @@ class DeliveryOutcome(enum.StrEnum):
     deduplicated = "deduplicated"
     quarantined = "quarantined"
     failed = "failed"
+
+
+# Import-time pin: this enum IS `models.DELIVERY_OUTCOME_VALUES`, the one
+# declaration the database CHECK is built from. A value added to either side
+# without the other would not error at runtime — it would quietly refuse
+# storable rows or store unreadable ones — so the drift fails here, at import,
+# where the suite cannot miss it. (Same posture as `engine._DEDUP_KEY_VALUES`
+# vs `policies.DEDUP_KEY_FIELDS`.)
+if {outcome.value for outcome in DeliveryOutcome} != DELIVERY_OUTCOME_VALUES:
+    raise AssertionError(
+        "ledger.DeliveryOutcome must equal models.DELIVERY_OUTCOME_VALUES — "
+        "the app enum and the schema CHECK are one vocabulary, declared once"
+    )
 
 
 # The outcomes that describe an EVENT rather than a rule, and are therefore the
@@ -184,18 +208,26 @@ RE_OWED_OUTCOMES = frozenset(
     {DeliveryOutcome.matched, DeliveryOutcome.awaiting_approval}
 )
 
-# The row states a re-delivery must SURFACE rather than act on: minting them
-# again risks a silent double-mint (`claimed` — the earlier attempt's fate is
-# unknown) or silently retries work that was permanently refused (`failed` —
-# §11's replay is the operator's verb for that, not an accidental re-delivery).
-# The engine reports these deliveries as `failed` with a detail and emits no
-# consequence.
+# The row states a re-delivery must never ACT on: minting them again risks a
+# silent double-mint (`claimed` — the earlier attempt's fate is unknown) or
+# silently retries work that was permanently refused (`failed` — §11's replay
+# is the operator's verb for that, not an accidental re-delivery). The engine
+# emits no consequence for either; what it REPORTS depends on the row: a FRESH
+# claim is another pass's mint in flight and dedups quietly, while a stale
+# claim or a failed row is a `failed` delivery with a detail, surfaced for an
+# operator (`engine.evaluate` owns the freshness split).
 RECONCILIATION_OUTCOMES = frozenset({DeliveryOutcome.claimed, DeliveryOutcome.failed})
 
 # The key namespaces (see the module docstring): prepended by `record`, never
 # by callers, so an event-level shape cannot be forged from a policy template.
 _POLICY_KEY_NAMESPACE = "p:"
 _EVENT_KEY_NAMESPACE = "e:"
+
+
+def _utc_now() -> datetime:
+    """`InMemoryDeliveryLedger`'s default clock — the in-process stand-in for
+    the timestamptz `func.now()` the real store's columns default to."""
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -319,10 +351,16 @@ class _Transition:
 
 
 _TRANSITIONS: dict[str, _Transition] = {
-    # matched -> claimed: the durable marker written BEFORE the sink call. This
-    # is the single-writer guard the whole minting design rests on.
+    # matched/awaiting_approval -> claimed: the durable marker written BEFORE
+    # the sink call. This is the single-writer guard the whole minting design
+    # rests on. `awaiting_approval` is legal FROM here because the mode gate
+    # lives in the MINTING layer (it claims only for a CURRENT `active` entry):
+    # a still-gated policy never reaches this verb, and a mode revised to
+    # `active` drains the queued rows instead of stranding them.
     "claim": _Transition(
-        "claim", DeliveryOutcome.claimed, frozenset({DeliveryOutcome.matched})
+        "claim",
+        DeliveryOutcome.claimed,
+        frozenset({DeliveryOutcome.matched, DeliveryOutcome.awaiting_approval}),
     ),
     # claimed -> created + ref, in ONE statement (the only shape the CHECK
     # allows, and the only shape that cannot leave a `created` row pointing at
@@ -357,6 +395,24 @@ _TRANSITIONS: dict[str, _Transition] = {
     "close_dry_run": _Transition(
         "close_dry_run", DeliveryOutcome.dry_run, frozenset({DeliveryOutcome.matched})
     ),
+    # failed -> matched: §11's replay verb hook. Declared here so the
+    # dead-letter has a legal exit an operator can invoke; NOT auto-invoked
+    # anywhere — an accidental re-delivery must never retry a permanent
+    # refusal.
+    "replay": _Transition(
+        "replay", DeliveryOutcome.matched, frozenset({DeliveryOutcome.failed})
+    ),
+    # claimed -> matched, by OPERATOR judgment rather than sink proof: the
+    # reconciliation verb for a stale claim verified never-sent (or resolved
+    # PM-side). Same shape as `release_claim`, deliberately a distinct verb —
+    # one is the sink's provable "never arrived", the other is a human's
+    # verdict, and an audit trail should be able to tell which released a row.
+    # NOT auto-invoked anywhere.
+    "release_stale_claim": _Transition(
+        "release_stale_claim",
+        DeliveryOutcome.matched,
+        frozenset({DeliveryOutcome.claimed}),
+    ),
 }
 
 
@@ -387,15 +443,18 @@ class _LedgerTransitions:
     def claim(
         self, tenant: str, dedup_key: str, *, detail: str | None = None
     ) -> LedgerTransition:
-        """Take ownership of a `matched` row before minting it (spec §7).
+        """Take ownership of a `matched` or `awaiting_approval` row before
+        minting it (spec §7).
 
         The durable marker that closes the crash window: written and committed
         BEFORE PM is called, so a mint whose confirmation is lost leaves a
-        `claimed` row rather than a `matched` one — and a `claimed` row is
-        never re-minted by a re-delivery, it is surfaced (see
-        `RECONCILIATION_OUTCOMES`). `applied=False` means another pass holds
-        the claim, or the work is already done; read `record.outcome` to tell
-        which."""
+        `claimed` row rather than a re-owable one — and a `claimed` row is
+        never re-minted by a re-delivery, it dedups while fresh and surfaces
+        once stale (see `RECONCILIATION_OUTCOMES`). Legal from
+        `awaiting_approval` because the mode gate is the MINTING layer's (it
+        claims only for a current `active` entry — see `_TRANSITIONS`).
+        `applied=False` means another pass holds the claim, or the work is
+        already done; read `record.outcome` to tell which."""
         return self._apply(
             _TRANSITIONS["claim"], tenant=tenant, dedup_key=dedup_key, detail=detail
         )
@@ -475,6 +534,45 @@ class _LedgerTransitions:
         policy's own mode forbids, on every re-delivery, forever."""
         return self._apply(
             _TRANSITIONS["close_dry_run"],
+            tenant=tenant,
+            dedup_key=dedup_key,
+            detail=detail,
+        )
+
+    def replay(self, tenant: str, dedup_key: str, *, detail: str) -> LedgerTransition:
+        """§11's replay verb hook: reopen a `failed` row as `matched`, so the
+        next re-delivery re-owes the consequence and the mint runs again —
+        after the operator has fixed whatever dead-lettered it (a revised
+        artifact, a repaired destination scope). NOT auto-invoked anywhere:
+        an accidental re-delivery retrying a permanent refusal is exactly what
+        the dead-letter exists to prevent, so the only way back is this
+        deliberate verb. `detail` is required for the same reason
+        `mark_failed`'s is — the row's story must say who reopened it and
+        why."""
+        return self._apply(
+            _TRANSITIONS["replay"],
+            tenant=tenant,
+            dedup_key=dedup_key,
+            detail=detail,
+        )
+
+    def release_stale_claim(
+        self, tenant: str, dedup_key: str, *, detail: str
+    ) -> LedgerTransition:
+        """The reconciliation verb for a claim an OPERATOR has verified
+        never-sent or resolved PM-side: back to `matched`, so the delivery
+        re-owes its mint. Guarded compare-and-set like every transition — a
+        pass confirming the claim concurrently wins, and this refuses.
+
+        Distinct from `release_claim` on purpose: that verb is the SINK's
+        provable "the request never arrived", applied in-pass; this one is a
+        human's verdict on a stale claim (§11's reconciliation queue), and NOT
+        auto-invoked anywhere — releasing a claim whose mint may have happened
+        is the silent double-mint the whole design forbids, so only a person
+        who checked PM gets to say so. `detail` is required: the row must
+        carry that verdict."""
+        return self._apply(
+            _TRANSITIONS["release_stale_claim"],
             tenant=tenant,
             dedup_key=dedup_key,
             detail=detail,
@@ -780,10 +878,17 @@ class InMemoryDeliveryLedger(_LedgerTransitions):
     the DATABASE enforces under concurrency (module docstring: "idempotent
     under concurrency, not just under re-delivery"). A dry-run is a single
     caller driving a single capture through in one thread, which is the only
-    claim this store needs to make good on."""
+    claim this store needs to make good on.
 
-    def __init__(self) -> None:
+    `clock` is the injectable time source for `created_at`/`updated_at` — the
+    in-memory analogue of the real store's server-side `func.now()` defaults.
+    Injectable because the stale-vs-live claim distinction (`engine.evaluate`)
+    is a fact about `updated_at`'s AGE, and a test proving it must be able to
+    write a deterministically old claim rather than sleeping."""
+
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
         self._rows: dict[tuple[str, str], LedgerRecord] = {}
+        self._clock = clock if clock is not None else _utc_now
 
     def record(
         self,
@@ -813,7 +918,7 @@ class InMemoryDeliveryLedger(_LedgerTransitions):
             event_id=event_id,
             event_type=event_type,
             outcome=outcome,
-            created_at=datetime.now(timezone.utc),
+            created_at=self._clock(),
             policy_id=policy_id,
             policy_version_id=policy_version_id,
             created_item_ref=None,
@@ -852,7 +957,7 @@ class InMemoryDeliveryLedger(_LedgerTransitions):
             existing,
             outcome=transition.to_outcome,
             detail=detail,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=self._clock(),
             created_item_ref=(
                 item_ref if transition.sets_item_ref else existing.created_item_ref
             ),

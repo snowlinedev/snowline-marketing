@@ -64,7 +64,7 @@ from typing import Protocol
 
 import httpx
 
-from snowline_marketing import classify, config
+from snowline_marketing import classify, config, thin_client
 
 log = logging.getLogger("snowline_marketing.policy_source")
 
@@ -267,11 +267,11 @@ class GatewayPolicyProvider:
             # client. Conflating them converts a missing route into a fleet-
             # wide silent match-none. So the route CONTRACT requires the
             # no-artifact answer to identify itself: a JSON body naming the
-            # tenant it is answering for. A bare framework 404 (FastAPI's
-            # {"detail": "Not Found"}) is treated as unavailable — stall
-            # visibly, let the operator find the deployment problem.
-            payload, _decode_failure = classify.decode_json_object(resp.content)
-            if payload is not None and payload.get("tenant") == tenant:
+            # tenant it is answering for (`thin_client.identified_404`, the
+            # discipline both thin clients share). A bare framework 404
+            # (FastAPI's {"detail": "Not Found"}) is treated as unavailable —
+            # stall visibly, let the operator find the deployment problem.
+            if thin_client.identified_404(resp, "tenant", tenant):
                 return PolicyResolutionError(
                     tenant=tenant,
                     failure=ResolutionFailure.not_found,
