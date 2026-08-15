@@ -85,6 +85,22 @@ def test_governance_url_default_and_strips_trailing_slash(monkeypatch):
     assert config.governance_url() == "http://governance.example"
 
 
+def test_claim_stale_seconds_env_is_lenient(monkeypatch):
+    # The stale-claim threshold shapes whether a re-delivery stays quiet or
+    # pages an operator (`engine.evaluate`), so a typo must fall back rather
+    # than turn every in-flight claim into an alarm (0/negative) or hide every
+    # orphaned one forever (inf/nan).
+    monkeypatch.delenv("MARKETING_CLAIM_STALE_SECONDS", raising=False)
+    assert config.claim_stale_seconds() == 900.0
+    monkeypatch.setenv("MARKETING_CLAIM_STALE_SECONDS", "300")
+    assert config.claim_stale_seconds() == 300.0
+    monkeypatch.setenv("MARKETING_CLAIM_STALE_SECONDS", "15m")
+    assert config.claim_stale_seconds() == 900.0  # malformed -> default
+    for absurd in ("0", "-5", "inf", "nan"):
+        monkeypatch.setenv("MARKETING_CLAIM_STALE_SECONDS", absurd)
+        assert config.claim_stale_seconds() == 900.0, f"{absurd!r} should fall back"
+
+
 def test_heartbeat_interval_env_is_lenient(monkeypatch):
     # A malformed or hot-looping value in the SHARED env var must not kill the
     # heartbeat (a dead heartbeat = a hollow gateway after the next platform

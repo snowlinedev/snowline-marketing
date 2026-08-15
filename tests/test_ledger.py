@@ -29,6 +29,7 @@ from snowline_marketing.ledger import (
     DeliveryLedger,
     DeliveryOutcome,
     InMemoryDeliveryLedger,
+    LedgerTransition,
 )
 from snowline_marketing.models import DeliveryLedgerEntry as DeliveryLedgerRow
 
@@ -214,6 +215,194 @@ def test_event_level_rows_may_omit_policy_and_version(ledger_store):
     assert write.inserted
     assert write.record.policy_id is None
     assert write.record.policy_version_id is None
+
+
+# --- the transition contract, run over BOTH stores ---------------------------
+#
+# Every one of these is a GUARDED compare-and-set (`ledger._TRANSITIONS`), and
+# the guard is what the minting layer's whole convergence story rests on: one
+# claim per row means one mint per delivery, and a transition that refuses tells
+# the caller — by the row it hands back — which of several very different
+# situations it is in.
+
+
+STORED_KEY = f"p:{KEY}"
+
+
+def _claimed(ledger) -> LedgerTransition:
+    _matched(ledger)
+    transition = ledger.claim(TENANT, STORED_KEY, detail="mint in flight")
+    assert transition.applied
+    return transition
+
+
+def test_a_claim_takes_a_matched_row_and_stamps_it(ledger_store):
+    write = _matched(ledger_store)
+    transition = ledger_store.claim(TENANT, STORED_KEY, detail="mint in flight")
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.claimed
+    assert transition.record.detail == "mint in flight"
+    # `created_at` marks the delivery's first convergence and must not move;
+    # `updated_at` is what makes a held claim measurable at all (§11).
+    assert transition.record.created_at == write.record.created_at
+    assert write.record.updated_at is None
+    assert transition.record.updated_at is not None
+
+
+def test_only_one_caller_can_claim_a_row(ledger_store):
+    _claimed(ledger_store)
+    second = ledger_store.claim(TENANT, STORED_KEY, detail="another pass")
+    assert not second.applied
+    # The refusing row comes back, because "who holds it" is the fact the
+    # caller needs: `claimed` means reconcile, `created` means nothing to do.
+    assert second.record.outcome is DeliveryOutcome.claimed
+    assert second.record.detail == "mint in flight"
+
+
+def test_confirming_a_claim_writes_the_outcome_and_the_ref_together(ledger_store):
+    _claimed(ledger_store)
+    transition = ledger_store.confirm_created(
+        TENANT, STORED_KEY, item_ref="pm-item-42", detail="minted"
+    )
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.created
+    assert transition.record.created_item_ref == "pm-item-42"
+
+
+def test_a_created_row_cannot_be_claimed_again(ledger_store):
+    _claimed(ledger_store)
+    ledger_store.confirm_created(TENANT, STORED_KEY, item_ref="pm-item-42")
+    refused = ledger_store.claim(TENANT, STORED_KEY)
+    assert not refused.applied
+    assert refused.record.outcome is DeliveryOutcome.created
+    assert refused.record.created_item_ref == "pm-item-42"
+
+
+def test_confirming_without_a_claim_is_refused(ledger_store):
+    _matched(ledger_store)
+    transition = ledger_store.confirm_created(TENANT, STORED_KEY, item_ref="pm-item-42")
+    assert not transition.applied
+    assert transition.record.outcome is DeliveryOutcome.matched
+    assert transition.record.created_item_ref is None
+
+
+def test_confirming_with_no_ref_is_refused_before_the_store_is_touched(ledger_store):
+    _claimed(ledger_store)
+    with pytest.raises(ValueError, match="requires the minted item's ref"):
+        ledger_store.confirm_created(TENANT, STORED_KEY, item_ref="  ")
+    assert ledger_store.get(TENANT, STORED_KEY).outcome is DeliveryOutcome.claimed
+
+
+def test_releasing_a_claim_puts_the_work_back_on_the_delivery(ledger_store):
+    _claimed(ledger_store)
+    transition = ledger_store.release_claim(TENANT, STORED_KEY, detail="PM down")
+    assert transition.applied
+    # Back to `matched` with no ref, which is exactly the shape the engine
+    # re-owes — re-delivery is the retry loop, no timer required.
+    assert transition.record.outcome is DeliveryOutcome.matched
+    assert transition.record.created_item_ref is None
+    assert ledger_store.claim(TENANT, STORED_KEY).applied
+
+
+def test_a_permanent_failure_closes_the_claim_with_its_reason(ledger_store):
+    _claimed(ledger_store)
+    transition = ledger_store.mark_failed(
+        TENANT, STORED_KEY, detail="PM rejected: no such scope"
+    )
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.failed
+    assert "no such scope" in transition.record.detail
+
+
+def test_marking_a_row_awaiting_approval_is_idempotent(ledger_store):
+    # The property that keeps "waiting" from becoming "spamming": the
+    # consequence is re-offered on every re-delivery, and only the first mark
+    # writes.
+    _matched(ledger_store)
+    first = ledger_store.mark_awaiting_approval(TENANT, STORED_KEY, detail="gated")
+    assert first.applied
+    assert first.record.outcome is DeliveryOutcome.awaiting_approval
+    second = ledger_store.mark_awaiting_approval(TENANT, STORED_KEY, detail="gated")
+    assert not second.applied
+    assert second.record.outcome is DeliveryOutcome.awaiting_approval
+    assert second.record.updated_at == first.record.updated_at
+
+
+def test_closing_a_dry_run_row_is_terminal(ledger_store):
+    _matched(ledger_store)
+    transition = ledger_store.close_dry_run(TENANT, STORED_KEY, detail="dry run")
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.dry_run
+    assert transition.record.created_item_ref is None
+    # Terminal: nothing may take it back out, which is what stops the row
+    # re-owing a mint the policy's own mode forbids.
+    assert not ledger_store.claim(TENANT, STORED_KEY).applied
+    assert not ledger_store.mark_awaiting_approval(
+        TENANT, STORED_KEY, detail="x"
+    ).applied
+    assert ledger_store.get(TENANT, STORED_KEY).outcome is DeliveryOutcome.dry_run
+
+
+def test_a_claim_takes_an_awaiting_approval_row_too(ledger_store):
+    # The mode gate is the MINTING layer's (it claims only for a current
+    # `active` entry), so the ledger's claim accepts a gated row: a policy
+    # revised from `approval_required` to `active` drains its queued rows on
+    # re-delivery instead of stranding them.
+    _matched(ledger_store)
+    ledger_store.mark_awaiting_approval(TENANT, STORED_KEY, detail="gated")
+    transition = ledger_store.claim(TENANT, STORED_KEY, detail="mode now active")
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.claimed
+
+
+def test_replay_is_the_declared_exit_from_a_dead_letter(ledger_store):
+    # §11's replay verb hook: failed -> matched, deliberate and operator-only
+    # (nothing auto-invokes it). The reopened row re-owes and is claimable, so
+    # the replayed mint can actually run.
+    _claimed(ledger_store)
+    ledger_store.mark_failed(TENANT, STORED_KEY, detail="PM rejected: no such scope")
+    transition = ledger_store.replay(
+        TENANT, STORED_KEY, detail="replayed after the artifact was revised"
+    )
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.matched
+    assert transition.record.created_item_ref is None
+    assert ledger_store.claim(TENANT, STORED_KEY).applied
+    # Guarded: replay means "reopen a dead letter" and nothing else.
+    refused = ledger_store.replay(TENANT, STORED_KEY, detail="again")
+    assert not refused.applied
+
+
+def test_release_stale_claim_is_the_declared_exit_from_a_claim(ledger_store):
+    # The reconciliation verb for a claim an operator verified never-sent (or
+    # resolved PM-side): claimed -> matched, guarded, never auto-invoked.
+    _claimed(ledger_store)
+    transition = ledger_store.release_stale_claim(
+        TENANT, STORED_KEY, detail="operator verified the request never arrived"
+    )
+    assert transition.applied
+    assert transition.record.outcome is DeliveryOutcome.matched
+    assert "never arrived" in transition.record.detail
+    # Compare-and-set: a row that is not claimed refuses...
+    assert not ledger_store.release_stale_claim(TENANT, STORED_KEY, detail="x").applied
+    # ...and a CONFIRMED row can never be released into a re-mint.
+    ledger_store.claim(TENANT, STORED_KEY)
+    ledger_store.confirm_created(TENANT, STORED_KEY, item_ref="pm-item-42")
+    refused = ledger_store.release_stale_claim(TENANT, STORED_KEY, detail="x")
+    assert not refused.applied
+    assert refused.record.outcome is DeliveryOutcome.created
+
+
+def test_a_transition_on_a_row_that_does_not_exist_reports_neither(ledger_store):
+    transition = ledger_store.claim(TENANT, "p:never-recorded")
+    assert not transition.applied
+    assert transition.record is None
+
+
+def test_transitions_are_isolated_per_tenant(ledger_store):
+    _matched(ledger_store)
+    assert not ledger_store.claim("snowlinedev", STORED_KEY).applied
+    assert ledger_store.get(TENANT, STORED_KEY).outcome is DeliveryOutcome.matched
 
 
 # --- DB-only: direct SQL, the read surface, the CHECK constraints -------------
@@ -437,3 +626,99 @@ def test_in_memory_never_overwrites_the_row():
     assert not repeat.inserted
     assert repeat.record.outcome is DeliveryOutcome.created
     assert repeat.record.created_item_ref == "pm-item-42"
+
+
+def test_the_in_memory_clock_is_injectable():
+    # The stale-vs-live claim distinction (`engine.evaluate`) is a fact about
+    # `updated_at`'s AGE, so the dry-run store takes a clock a test controls —
+    # the in-process analogue of the real store's server-side now().
+    from datetime import datetime, timezone
+
+    frozen = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ledger = InMemoryDeliveryLedger(clock=lambda: frozen)
+    write = _matched(ledger)
+    assert write.record.created_at == frozen
+    claim = ledger.claim(TENANT, STORED_KEY, detail="mint in flight")
+    assert claim.record.updated_at == frozen
+
+
+def test_the_outcome_vocabulary_is_declared_once():
+    # The import-time pin's other half, visible in the suite: the app enum and
+    # the schema CHECK are both built from models.DELIVERY_OUTCOME_VALUES, so
+    # a value cannot be admitted on one side and dropped on the other. (The
+    # migrations keep deliberate literal copies — history does not grow.)
+    from snowline_marketing import models
+
+    assert {outcome.value for outcome in DeliveryOutcome} == (
+        models.DELIVERY_OUTCOME_VALUES
+    )
+
+
+def test_two_passes_racing_one_claim_resolve_in_the_database(migrated_db):
+    # The claim is a compare-and-set, not a check-then-write: two ledger
+    # handles (two processes, in production) see the same row and exactly one
+    # is entitled to mint. Same guarantee `inserted` gives on the insert.
+    _matched(DeliveryLedger())
+    first = DeliveryLedger().claim(TENANT, f"p:{KEY}", detail="pass A")
+    second = DeliveryLedger().claim(TENANT, f"p:{KEY}", detail="pass B")
+    assert first.applied
+    assert not second.applied
+    assert second.record.detail == "pass A"
+
+
+def test_list_by_outcome_serves_the_three_operator_queues(migrated_db):
+    # §11 reads three queues off one column: dead-letter (`failed`),
+    # reconciliation (`claimed`), approval (`awaiting_approval`). The states are
+    # this item's to RECORD; the verbs are §11/§12's.
+    ledger = DeliveryLedger()
+    for index, transition in enumerate(("claimed", "failed", "awaiting_approval")):
+        key = f"{TENANT}:policy:{index}"
+        _matched(ledger, dedup_key=key, event_id=f"pm-evt-{index}")
+        stored = f"p:{key}"
+        ledger.claim(TENANT, stored, detail="claimed")
+        if transition == "failed":
+            ledger.mark_failed(TENANT, stored, detail="PM rejected it")
+        elif transition == "awaiting_approval":
+            ledger.release_claim(TENANT, stored, detail="back to matched")
+            ledger.mark_awaiting_approval(TENANT, stored, detail="gated")
+    assert [
+        r.dedup_key for r in ledger.list_by_outcome(TENANT, DeliveryOutcome.claimed)
+    ] == [f"p:{TENANT}:policy:0"]
+    assert [
+        r.detail for r in ledger.list_by_outcome(TENANT, DeliveryOutcome.failed)
+    ] == ["PM rejected it"]
+    assert len(ledger.list_by_outcome(TENANT, DeliveryOutcome.awaiting_approval)) == 1
+    assert ledger.list_by_outcome(TENANT, DeliveryOutcome.created) == []
+    # Isolation holds on the read side, like every other listing here.
+    assert ledger.list_by_outcome("snowlinedev", DeliveryOutcome.claimed) == []
+
+
+def test_the_new_outcomes_are_storable_and_the_old_check_still_bites(migrated_db):
+    # The migration's CHECK swap, from both sides: the minting vocabulary must
+    # be storable, and a typo must still be refused (§11's dashboard FILTERS on
+    # this column, so a bad value would drop rows out of the audit view rather
+    # than error).
+    ledger = DeliveryLedger()
+    for index, outcome in enumerate(
+        (
+            DeliveryOutcome.claimed,
+            DeliveryOutcome.awaiting_approval,
+            DeliveryOutcome.dry_run,
+        )
+    ):
+        key = f"{TENANT}:vocabulary:{index}"
+        _matched(ledger, dedup_key=key, event_id=f"pm-evt-v{index}")
+        stored = f"p:{key}"
+        if outcome is DeliveryOutcome.claimed:
+            ledger.claim(TENANT, stored)
+        elif outcome is DeliveryOutcome.awaiting_approval:
+            ledger.mark_awaiting_approval(TENANT, stored, detail="gated")
+        else:
+            ledger.close_dry_run(TENANT, stored, detail="dry run")
+        assert ledger.get(TENANT, stored).outcome is outcome
+    _rejects(
+        dedup_key="claimed-ish",
+        policy_id="p",
+        outcome="claimed_maybe",
+        policy_version_id=VERSION_ID,
+    )

@@ -14,7 +14,7 @@
         "scope": "snowlinedev/marketing",
         "initiative": "messaging"
       },
-      "title_template": "Refresh Snowline messaging for {subject_title}",
+      "title_template": "Refresh Snowline messaging for {details.title}",
       "body_template": "{event_type} on {scope} carried a marketing-impact signal. Review the canonical messaging artifact and refresh what changed.",
       "artifact_refs": ["b964d217"],
       "deliverable_classes": ["positioning_copy"],
