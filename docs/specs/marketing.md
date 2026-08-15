@@ -55,10 +55,20 @@ Edge is the first configuration, Snowline itself is the intended second.
 
 - **Delivery ledger** — one row per consumed event × matched policy:
   logical key `tenant + policy_id + event_id`, outcome
-  (matched / ignored / created / deduplicated / quarantined / failed),
-  created item ref, evaluated policy artifact version id, timestamps.
-  Creation and ledger write are atomic or recoverably convergent;
-  re-delivery returns the existing result.
+  (matched / claimed / created / awaiting_approval / dry_run / ignored /
+  quarantined / failed; `deduplicated` is a delivery-level answer, never a
+  row state), created item ref, evaluated policy artifact version id,
+  timestamps. Row states beyond the original enumeration exist because
+  minting is two durable steps: `claimed` is the compare-and-set marker
+  written BEFORE the mint call (closing the double-mint crash window; a
+  fresh claim is an in-flight mint, a stale one surfaces for
+  reconciliation), `awaiting_approval` parks an approval-gated match
+  (drained by §12's operator verb or by the policy's mode being revised to
+  active), and `dry_run` terminally closes a match whose mode minted
+  nothing on purpose. `failed` is the dead-letter; declared operator verbs
+  (`replay`, `release_stale_claim`) are its only exits. Minting happens per
+  event BEFORE the intake ack, so creation and ledger write are recoverably
+  convergent; re-delivery returns the existing result.
 - **Deliverable provenance ledger** — one row per deliverable instance:
   channel, deliverable class, source artifact version ids (carrying their
   milestone stamps), producing item ref, produced_at, external URL.
@@ -106,7 +116,9 @@ A policy entry (schema versioned inside the body):
   values/globs, no code;
 - consequence type: messaging refresh, listing regeneration, screenshot
   review, announcement preparation, launch plan, review sweep, metrics
-  snapshot;
+  snapshot, channel publish (§12; never legal in mode `active` —
+  publishing is approval-gated, and a policy declaring otherwise
+  quarantines);
 - destination scope / initiative / phase for minted work, title/body/
   ownership templates, `human_owned` and musher-dispatch opt-in flags;
 - affected artifact refs, channels, deliverable classes;
@@ -121,9 +133,16 @@ or match-none.
 Minted through PM's surface (gateway), landing on the canonical roadmap.
 Every minted item body carries provenance: originating event + entity,
 matched policy + version, source scope/initiative/milestone, external refs
-(reconciled PR / release URL) when present, affected artifacts/channels.
-No standalone GitHub marketing issues — GitHub involvement stays PM
-mirroring.
+(reconciled PR / release URL) when present, affected artifacts/channels,
+and the delivery ledger key. The provenance block is appended by the
+plugin regardless of template, and template-derived text is neutralized
+against the block's own grammar so provenance cannot be forged by a
+producer or a template. Title/body/ownership templates render from a
+defined vocabulary: the delivery identity and the envelope's predicate
+surface as closed placeholders, plus open `{details.<key>}` access; a
+template that cannot render for an event is a per-delivery failure
+(dead-lettered), never a crashed pass. No standalone GitHub marketing
+issues — GitHub involvement stays PM mirroring.
 
 Items minted with the policy's dispatch opt-in flow to musher through PM's
 watcher (snowline-pm #65/#66) — the plugin sets the flag, it does not call
