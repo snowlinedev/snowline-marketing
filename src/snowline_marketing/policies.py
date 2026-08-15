@@ -259,6 +259,12 @@ class PolicyEntry(_Model):
     # syntax. The rendering vocabulary belongs to the minting item (spec §7),
     # and pinning it here would make every new provenance field a policy-schema
     # change. (Contrast `dedup_key_template`, whose failure mode is silent.)
+    # That vocabulary now exists, in `rendering.py`: a closed half over the
+    # envelope and this entry, plus an open `{details.<key>}` half over the
+    # free-form payload map. Because the open half cannot be checked without an
+    # event in hand, an unrenderable template is a per-delivery MINT failure
+    # (an operator-visible `failed` ledger row), never a quarantined version —
+    # the asymmetry `rendering.py`'s docstring spells out.
     title_template: NonEmptyStr
     body_template: NonEmptyStr
     # §6's "ownership template" — who the minted item is assigned to, when the

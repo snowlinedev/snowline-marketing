@@ -372,6 +372,85 @@ def test_a_re_owed_consequence_carries_the_current_version(migrated_db):
     assert second.deliveries[0].record.policy_version_id == VERSION_ID
 
 
+def test_a_gated_row_keeps_re_owing_its_consequence(migrated_db):
+    # `awaiting_approval` is a GATE, not a settlement: the work is owed and
+    # withheld, so a re-delivery must keep offering it (§12's verb is what
+    # releases it). Rounding it down to `deduplicated` would lose the work the
+    # moment the operator was ready to approve it.
+    envelope = fixture_envelope(COMPLETED_FIXTURE)
+    resolution = resolved()
+    first = evaluate(envelope, resolution)
+    assert isinstance(first, EvaluationResult)
+    (consequence,) = first.consequences
+    DeliveryLedger().mark_awaiting_approval(
+        TENANT, consequence.dedup_key, detail="gated"
+    )
+    second = evaluate(envelope, resolution)
+    assert isinstance(second, EvaluationResult)
+    assert second.outcomes == (DeliveryOutcome.matched,)
+    (re_owed,) = second.consequences
+    assert re_owed.dedup_key == consequence.dedup_key
+    assert second.deliveries[0].record.outcome is DeliveryOutcome.awaiting_approval
+
+
+def test_a_closed_dry_run_row_is_settled_and_owes_nothing(migrated_db):
+    # The other half of the same question, and the reason `dry_run` had to be a
+    # row state at all: a dry-run match produced no work ON PURPOSE, so it must
+    # stop re-owing — otherwise it re-offers a mint its own mode forbids on
+    # every delivery, forever.
+    envelope = fixture_envelope(COMPLETED_FIXTURE)
+    resolution = resolved()
+    first = evaluate(envelope, resolution)
+    assert isinstance(first, EvaluationResult)
+    (consequence,) = first.consequences
+    DeliveryLedger().close_dry_run(TENANT, consequence.dedup_key, detail="dry run")
+    second = evaluate(envelope, resolution)
+    assert isinstance(second, EvaluationResult)
+    assert second.outcomes == (DeliveryOutcome.deduplicated,)
+    assert second.consequences == ()
+    assert second.deliveries[0].record.outcome is DeliveryOutcome.dry_run
+
+
+def test_a_claimed_row_surfaces_instead_of_being_re_owed(migrated_db):
+    # The crash window's other end (`minting.py` writes the claim before it
+    # calls PM): the mint may have happened, so re-minting could duplicate and
+    # `deduplicated` could assert work that does not exist. Neither is
+    # acceptable silently, so the delivery says `failed` and names the row.
+    envelope = fixture_envelope(COMPLETED_FIXTURE)
+    resolution = resolved()
+    first = evaluate(envelope, resolution)
+    assert isinstance(first, EvaluationResult)
+    (consequence,) = first.consequences
+    DeliveryLedger().claim(TENANT, consequence.dedup_key, detail="mint in flight")
+    second = evaluate(envelope, resolution)
+    assert isinstance(second, EvaluationResult)
+    assert second.outcomes == (DeliveryOutcome.failed,)
+    assert second.consequences == ()
+    (delivery,) = second.deliveries
+    assert delivery.record.outcome is DeliveryOutcome.claimed
+    assert "refusing to re-mint" in delivery.detail
+    # The ROW is untouched — this delivery recorded nothing, exactly like the
+    # within-evaluation collision path.
+    assert delivery.record.detail == "mint in flight"
+
+
+def test_a_dead_lettered_row_is_not_retried_by_a_re_delivery(migrated_db):
+    envelope = fixture_envelope(COMPLETED_FIXTURE)
+    resolution = resolved()
+    first = evaluate(envelope, resolution)
+    assert isinstance(first, EvaluationResult)
+    (consequence,) = first.consequences
+    ledger = DeliveryLedger()
+    ledger.claim(TENANT, consequence.dedup_key)
+    ledger.mark_failed(TENANT, consequence.dedup_key, detail="PM refused it")
+    second = evaluate(envelope, resolution)
+    assert isinstance(second, EvaluationResult)
+    # §11's replay is the way back from a dead letter — not the accident of
+    # another delivery.
+    assert second.outcomes == (DeliveryOutcome.failed,)
+    assert second.consequences == ()
+
+
 def test_a_repeat_ignored_event_is_a_no_op_too(migrated_db):
     # Event-level rows converge exactly like policy rows: an unmatched event
     # re-delivered ten times leaves one audit row, not ten.

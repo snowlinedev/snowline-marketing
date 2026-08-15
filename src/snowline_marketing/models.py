@@ -228,14 +228,20 @@ class DeliveryLedgerEntry(Base):
     event_id: Mapped[str] = mapped_column(Text, nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
 
-    # matched / ignored / created / deduplicated / quarantined / failed — spec
-    # §4's enumeration, mirrored by `ledger.DeliveryOutcome`. A plain String
-    # with an app-side enum plus a value CHECK, not a native PG ENUM (adding a
-    # value to a PG enum is its own ALTER TYPE migration that cannot run inside
-    # a transaction on older servers). The CHECK is worth its migration cost
-    # here because §11's dashboard FILTERS on this column: a typo'd outcome
+    # Spec §4's enumeration plus the three states the minting layer needs to be
+    # able to say (`claimed`, `awaiting_approval`, `dry_run` — see
+    # `ledger.DeliveryOutcome` for what each one means and why none of them
+    # could be folded into an existing value). A plain String with an app-side
+    # enum plus a value CHECK, not a native PG ENUM (adding a value to a PG enum
+    # is its own ALTER TYPE migration that cannot run inside a transaction on
+    # older servers) — which is exactly why growing this vocabulary cost one
+    # CHECK swap rather than a type rewrite. The CHECK is worth its migration
+    # cost because §11's dashboard FILTERS on this column: a typo'd outcome
     # would not error, it would quietly drop rows out of the audit view.
-    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    # String(32), not (16): `awaiting_approval` is 17 characters, and truncating
+    # the vocabulary to fit a width chosen before it existed would be the schema
+    # dictating the audit's words.
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
 
     # The governance artifact VERSION evaluated for this delivery — spec §6's
     # contract requirement ("records the evaluated version id on every ledger
@@ -269,10 +275,27 @@ class DeliveryLedgerEntry(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # When the row last TRANSITIONED (spec §7's minting layer: claimed →
+    # created / failed, matched → awaiting_approval / dry_run). NULL until the
+    # first transition, so "recorded but never acted on" is a state the column
+    # states rather than one a reader infers. No ORM `onupdate`, for the same
+    # reason `ConsumerCursor.updated_at` has none: the only writers are the
+    # guarded single-statement UPDATEs in `ledger._LedgerTransitions`, which
+    # bypass ORM update hooks and set this explicitly.
+    #
+    # `created_at` deliberately still never moves — it marks the delivery's
+    # first convergence — so this is the only column that can answer "how long
+    # has this claim been held?", which is the whole basis of §11's
+    # reconciliation and dead-letter queues.
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (
         CheckConstraint(
-            "outcome IN ('matched', 'ignored', 'created', 'deduplicated', "
-            "'quarantined', 'failed')",
+            "outcome IN ('matched', 'ignored', 'claimed', 'created', "
+            "'awaiting_approval', 'dry_run', 'deduplicated', 'quarantined', "
+            "'failed')",
             name="ck_delivery_ledger_outcome",
         ),
         # Both directions: policy-level outcomes must name the rule that

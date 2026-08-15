@@ -27,6 +27,15 @@ Env vars:
                              `*_BASE_URL`, and inventing an unprefixed
                              SNOWLINE_GOVERNANCE_URL here would collide with
                              governance's own knob for a different meaning.
+  MARKETING_PM_URL         — where the PM service runs. Minted follow-through
+                             lands on the canonical roadmap through PM's
+                             surface (spec §7) and this is the base URL
+                             `work_sink.PMWorkItemSink` posts to.
+                             MARKETING-prefixed for the same reason
+                             MARKETING_GOVERNANCE_URL is: PM publishes its own
+                             SNOWLINE_PM_BASE_URL for where PM says it runs,
+                             and this knob is marketing's own view of that
+                             dependency.
   MARKETING_BIND_HOST      — the host this service binds to. Defaults to the
                              loopback address (spec §2: "loopback bind") — a
                              deploy that wants tailnet exposure sets this
@@ -66,6 +75,12 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8805"
 # needs no configuration at all.
 DEFAULT_GOVERNANCE_URL = "http://127.0.0.1:8848"
 
+# Where PM lives — the service holding the canonical roadmap minted work lands
+# on (spec §7). Matches PM's OWN default base URL (verified in snowline-pm's
+# config: DEFAULT_BASE_URL = "http://127.0.0.1:8802"), so a single-host dev box
+# needs no configuration at all.
+DEFAULT_PM_URL = "http://127.0.0.1:8802"
+
 # Loopback-first bind (spec §2) — a deploy that wants tailnet/LAN exposure
 # sets MARKETING_BIND_HOST explicitly; the service never defaults to a
 # wildcard.
@@ -93,6 +108,11 @@ def base_url() -> str:
 
 def governance_url() -> str:
     raw = os.environ.get("MARKETING_GOVERNANCE_URL", DEFAULT_GOVERNANCE_URL)
+    return raw.rstrip("/")
+
+
+def pm_url() -> str:
+    raw = os.environ.get("MARKETING_PM_URL", DEFAULT_PM_URL)
     return raw.rstrip("/")
 
 

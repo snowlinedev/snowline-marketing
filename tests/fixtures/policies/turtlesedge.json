@@ -14,7 +14,7 @@
         "scope": "turtlesedge/marketing",
         "initiative": "messaging"
       },
-      "title_template": "Refresh messaging for {subject_title}",
+      "title_template": "Refresh messaging for {details.title}",
       "body_template": "{event_type} on {scope} carried a marketing-impact signal. Review the canonical messaging artifact and refresh what changed.",
       "artifact_refs": ["b964d217"],
       "deliverable_classes": ["positioning_copy"],
@@ -51,7 +51,7 @@
       "destination": {
         "scope": "turtlesedge/marketing"
       },
-      "title_template": "Review screenshots after {subject_title}",
+      "title_template": "Review screenshots after {details.title}",
       "body_template": "UI work landed on {scope}. Check whether the shipped screenshot set still reflects the app.",
       "channels": ["app_store"],
       "deliverable_classes": ["screenshot_set"],

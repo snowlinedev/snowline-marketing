@@ -48,15 +48,33 @@ the row says `matched` and the item ref the minting layer (§7) writes on
 success is still NULL. Such a row is a claim on work that was never produced,
 and re-delivery is the recovery — the conflicting delivery re-emits the
 consequence, keyed to the SAME row, instead of reporting `deduplicated` and
-losing the work forever. Only a row that shows the work was produced (outcome
-`created`, or a non-null item ref) answers a repeat delivery with
-`deduplicated` and no consequence. The re-emitted consequence carries the
-CURRENT policy entry and version while the row keeps the version that first
-claimed the key: the row is the audit of the claim as it was decided, and the
-mint that eventually happens is the one the current policy would produce —
-which is the honest answer for work being done now. Event-level rows
+losing the work forever. The re-emitted consequence carries the CURRENT policy
+entry and version while the row keeps the version that first claimed the key:
+the row is the audit of the claim as it was decided, and the mint that
+eventually happens is the one the current policy would produce — which is the
+honest answer for work being done now. Event-level rows
 (`ignored`/`quarantined`) have no second step, so a repeat delivery of one is
 always `deduplicated`.
+
+**Which rows re-owe is the LEDGER's statement, not this module's.** Since §7
+landed, a row can be in more states than "matched or done", and the engine
+reads the three sets `ledger.py` declares rather than testing outcomes by hand:
+
+- `RE_OWED_OUTCOMES` (`matched`, `awaiting_approval`) with no item ref — the
+  work is still owed, so the delivery re-emits the consequence. The gated case
+  is deliberate: an approval-gated match re-offers its consequence on every
+  re-delivery, and the minting pass declines to mint it every time, which is
+  what "waiting" has to look like when nobody is holding it in memory.
+- `RECONCILIATION_OUTCOMES` (`claimed`, `failed`) — a row an OPERATOR resolves.
+  A claimed row's mint may have succeeded with its confirmation lost, so
+  re-minting would duplicate and reporting `deduplicated` would assert work
+  that may not exist; a failed row was permanently refused and §11's replay
+  owns it. Both report a DELIVERY-level `failed` with a detail and write
+  nothing.
+- Everything else settled (`created`, `dry_run`) answers `deduplicated`. A
+  `dry_run` row is settled precisely because a dry-run match produced no work
+  on purpose — the one outcome where "nothing exists" and "nothing is owed" are
+  both true.
 
 **Cross-tenant deliveries are consumed, not stalled.** An envelope whose tenant
 is not the one being evaluated will never match legitimately no matter how many
@@ -78,6 +96,8 @@ from dataclasses import dataclass
 
 from snowline_marketing.events import EventEnvelope
 from snowline_marketing.ledger import (
+    RE_OWED_OUTCOMES,
+    RECONCILIATION_OUTCOMES,
     DeliveryLedger,
     DeliveryOutcome,
     LedgerRecord,
@@ -267,14 +287,14 @@ class Delivery:
     Two outcomes live here and they are not the same question. `outcome` is what
     THIS delivery decided — `matched` when it claimed the key (or found it
     claimed but the work still owed — see the module docstring's recoverable
-    convergence), `deduplicated` when the key's row shows the work was already
-    produced, `failed` when a within-evaluation key collision refused the
-    delivery, `ignored`/`quarantined` for the event-level rows on their first
-    delivery. `record.outcome` is what the ROW says, which on a repeat delivery
-    is whatever the earlier one left there — possibly `created`, with a PM item
-    ref beside it. They coincide on a fresh delivery and diverge on every
-    repeat, and both are worth having: the first answers "what did this pass
-    do?", the second answers "what is the state of this work?" (spec §4:
+    convergence), `deduplicated` when the key's row is settled, `failed` when a
+    within-evaluation key collision refused the delivery or the row needs
+    operator reconciliation, `ignored`/`quarantined` for the event-level rows on
+    their first delivery. `record.outcome` is what the ROW says, which on a
+    repeat delivery is whatever the earlier one left there — possibly `created`,
+    with a PM item ref beside it. They coincide on a fresh delivery and diverge
+    on every repeat, and both are worth having: the first answers "what did this
+    pass do?", the second answers "what is the state of this work?" (spec §4:
     re-delivery returns the existing result).
 
     `consequence` is non-None exactly when `outcome is matched` — including the
@@ -283,9 +303,10 @@ class Delivery:
     mints once.
 
     `detail` is the operator-facing note for the deliveries whose outcome alone
-    does not explain itself (today: the within-evaluation key collision
-    reported as `failed`). Distinct from `record.detail`, which belongs to the
-    ROW — a collision delivery deliberately never wrote one."""
+    does not explain itself: the within-evaluation key collision, and the
+    re-delivery that landed on a `claimed`/`failed` row. Distinct from
+    `record.detail`, which belongs to the ROW — neither of those deliveries
+    writes one."""
 
     outcome: DeliveryOutcome
     record: LedgerRecord
@@ -658,26 +679,60 @@ def evaluate(
             detail=f"matched in mode {entry.mode.value!r}",
         )
         record = write.record
-        if not write.inserted and not (
-            record.outcome is DeliveryOutcome.matched
-            and record.created_item_ref is None
-        ):
-            # The key was already claimed AND the row shows the work was
-            # produced — outcome `created`, or an item ref already written.
-            # No consequence: the earlier delivery's result stands, and this
-            # is the one case a repeat delivery owes nothing. Spec §4.
+        re_owed = record.outcome in RE_OWED_OUTCOMES and record.created_item_ref is None
+        if not write.inserted and record.outcome in RECONCILIATION_OUTCOMES:
+            # The row is one an OPERATOR has to resolve, not one this pass may
+            # act on (`ledger.RECONCILIATION_OUTCOMES`). Two shapes, one rule:
+            #
+            # - `claimed` — a minting pass wrote the claim, called PM, and its
+            #   confirmation never landed. The mint may have happened. Emitting
+            #   a consequence would re-mint it, and reporting `deduplicated`
+            #   would assert work exists that may not. Both are silent; the
+            #   spec forbids both, so the delivery says `failed` out loud and
+            #   §11's reconciliation owns the row.
+            # - `failed` — PM permanently refused this mint (or its templates
+            #   would not render). Retrying on the accident of a re-delivery
+            #   would defeat the point of a dead-letter; §11's replay is the
+            #   verb for it.
+            #
+            # The ledger is NOT touched: the row already says what it says, and
+            # nothing this delivery learned changes it.
+            detail = (
+                f"delivery of event {envelope.event_id!r} landed on a row in "
+                f"state {record.outcome.value!r} (policy {entry.policy_id!r}, "
+                f"key {record.dedup_key!r}) — refusing to re-mint or to report "
+                "it as done; an operator resolves this row (spec §11)"
+            )
+            logging.getLogger("snowline_marketing.engine").warning(
+                "delivery for tenant %r needs reconciliation: policy %r, "
+                "event %r, row state %r",
+                tenant,
+                entry.policy_id,
+                envelope.event_id,
+                record.outcome.value,
+            )
+            delivery = Delivery(
+                outcome=DeliveryOutcome.failed, record=record, detail=detail
+            )
+        elif not write.inserted and not re_owed:
+            # The key was already claimed AND the row is SETTLED — `created`
+            # (the work exists, with an item ref beside it) or `dry_run` (the
+            # match deliberately produced none, §11). No consequence: the
+            # earlier delivery's result stands, and this is the case a repeat
+            # delivery owes nothing. Spec §4.
             delivery = Delivery(outcome=DeliveryOutcome.deduplicated, record=record)
         else:
-            # Either this delivery won the insert, or the existing row is a
-            # `matched` claim with no item ref — a mint that never happened
-            # (a crash between the ledger commit and §7's mint/ack, or a mint
-            # still in flight). Both owe the same thing: a consequence, keyed
-            # to the row that holds the claim. This is spec §4's "recoverably
-            # convergent" (module docstring): the consequence is built from
-            # the CURRENT entry and version — the row may keep an older
-            # version id, and correctly so, because the row audits the claim
-            # as it was decided while the mint that eventually happens is the
-            # one the current policy would produce.
+            # Either this delivery won the insert, or the existing row still
+            # OWES its work (`ledger.RE_OWED_OUTCOMES` with no item ref): a
+            # `matched` row whose mint never happened — a crash between the
+            # ledger commit and §7's claim — or an `awaiting_approval` row
+            # whose mint is gated on §12's operator verb. All owe the same
+            # thing: a consequence, keyed to the row that holds the claim. This
+            # is spec §4's "recoverably convergent" (module docstring): the
+            # consequence is built from the CURRENT entry and version — the row
+            # may keep an older version id, and correctly so, because the row
+            # audits the claim as it was decided while the mint that eventually
+            # happens is the one the current policy would produce.
             delivery = Delivery(
                 outcome=DeliveryOutcome.matched,
                 record=record,
