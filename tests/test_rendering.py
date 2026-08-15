@@ -441,3 +441,56 @@ def test_the_mode_is_rendered_from_the_entry_not_assumed():
         consequence(entry=entry(mode=PolicyMode.approval_required))
     )
     assert values["mode"] == "approval_required"
+
+
+def test_output_cap_measures_the_neutralized_text():
+    # Neutralization lengthens the body (the escaped heading is longer than
+    # the original), so the cap must be checked AFTER it — the cap bounds what
+    # is actually posted to PM, not an intermediate form.
+    from conftest import make_envelope
+
+    from snowline_marketing.engine import PendingConsequence
+    from snowline_marketing.events import EventType, parse_envelope
+    from snowline_marketing.policies import PolicyEntry
+    from snowline_marketing.rendering import (
+        _OUTPUT_CAPS,
+        PROVENANCE_HEADING,
+        RenderFailure,
+        render_mint_request,
+    )
+
+    cap = _OUTPUT_CAPS["body_template"]
+    heading_count = cap // len(PROVENANCE_HEADING)
+    # Fits the cap BEFORE neutralization, exceeds it after.
+    forged = PROVENANCE_HEADING * heading_count
+    assert len(forged) <= cap
+
+    envelope = parse_envelope(
+        make_envelope(EventType.item_completed, event_id="pm-evt-cap")
+    )
+    entry = PolicyEntry.model_validate(
+        {
+            "policy_id": "cap-check",
+            "event_types": ["item_completed"],
+            "consequence": "messaging_refresh",
+            "destination": {"scope": "turtlesedge/marketing"},
+            "title_template": "t",
+            "body_template": "{details.forged}",
+        }
+    )
+    consequence = PendingConsequence(
+        tenant="turtlesedge",
+        envelope=envelope.model_copy(
+            update={
+                "payload": envelope.payload.model_copy(
+                    update={"details": {"forged": forged}}
+                )
+            }
+        ),
+        entry=entry,
+        policy_version_id="pv-cap",
+        dedup_key="p:turtlesedge:cap-check:pm-evt-cap",
+    )
+    result = render_mint_request(consequence)
+    assert isinstance(result, RenderFailure)
+    assert "over the" in result.detail

@@ -460,6 +460,11 @@ def render_mint_request(consequence: PendingConsequence) -> MintRequest | Render
             problems.append(f"{field_name}: {exc.detail}")
             missing.update(exc.missing)
             continue
+        # Neutralize BEFORE the cap check: the escaped heading is longer than
+        # the original, so a body measured pre-neutralization could pass the
+        # cap and then grow past it. The cap's job is to bound what is POSTED,
+        # so it must measure the text that will actually be posted.
+        text = text.replace(PROVENANCE_HEADING, NEUTRALIZED_PROVENANCE_HEADING)
         cap = _OUTPUT_CAPS[field_name]
         if len(text) > cap:
             # A runaway output is a template problem like any other: fail THIS
@@ -482,13 +487,10 @@ def render_mint_request(consequence: PendingConsequence) -> MintRequest | Render
             ),
             missing=tuple(sorted(missing)),
         )
-    # Neutralize any forged heading BEFORE appending the genuine block (see
-    # NEUTRALIZED_PROVENANCE_HEADING): the rendered body is template-derived
-    # text, and the one invariant a reader gets is that the un-escaped heading
-    # appears exactly once, on the block this plugin wrote.
-    body_text = rendered["body_template"].replace(
-        PROVENANCE_HEADING, NEUTRALIZED_PROVENANCE_HEADING
-    )
+    # Neutralization already happened per field (before the cap check, which
+    # must measure what is actually posted); the one invariant stands — the
+    # un-escaped heading appears exactly once, on the appended genuine block.
+    body_text = rendered["body_template"]
     return MintRequest(
         tenant=consequence.tenant,
         scope=entry.destination.scope,
