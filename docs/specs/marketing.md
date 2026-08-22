@@ -208,13 +208,24 @@ observation even though it may never BLOCK a completion.
 The staleness sweep compares, per channel/deliverable class:
 
 - source artifact current version vs the version recorded in deliverable
-  provenance (the milestone stamp from Snowline#141 gives the release
-  boundary — "listing reflects the v1-stamped feature list, but a
-  v2-stamped version now exists");
-- release milestone events vs deliverable produced_at;
+  provenance — **version inequality is v1's only sweep trigger** (settled
+  2026-08-22). The milestone stamp from Snowline#141 refines the finding's
+  STORY ("listing reflects the v1-stamped feature list, but a v2-stamped
+  version now exists") and is reported in a finding's details when the
+  boundary moved; it is never a trigger of its own, so the sweep works
+  unchanged against artifacts nobody has stamped yet;
 - asset freshness for screenshot classes, delegated to the asset plugin
   (walkthrough-mcp) for capture — the marketing plugin only tracks
   staleness and mints review work.
+
+Release-milestone-vs-produced_at is deliberately NOT a sweep comparison at
+v1 (settled 2026-08-22, narrowing the contract's earlier bullet): a
+release-driven review is an ordinary `milestone_released` event policy
+through the same machinery — evented, not polled, and already expressible
+per tenant. The caveat that would reopen this: an event policy cannot
+condition on deliverable freshness ("mint only if the deliverable predates
+the release"), so if that filter is ever wanted, it returns as a sweep
+concern rather than a policy feature.
 
 Findings mint (deduplicated) staleness items through the same policy
 machinery; a finding whose deliverable is already covered by an open minted

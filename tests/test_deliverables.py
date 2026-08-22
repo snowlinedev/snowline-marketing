@@ -256,7 +256,67 @@ def test_one_artifact_at_two_versions_is_refused(deliverable_store):
     assert deliverable_store.list_for_item(TENANT, ITEM) == []
 
 
+def test_list_for_tenant_is_newest_first_and_isolated(deliverable_store):
+    # §11's provenance listing AND §8's staleness sweep input — which is why it
+    # runs over both stores now: the sweep is developed fixtures-first, so a
+    # read only Postgres could answer would leave it with no fixtures-first
+    # path (`InMemoryDeliverables.list_for_tenant`).
+    _listing(deliverable_store)
+    _listing(deliverable_store, item_ref="mkt-item-0009", event_id="pm-evt-9")
+    _listing(deliverable_store, tenant="snowlinedev", event_id="pm-evt-other")
+    rows = deliverable_store.list_for_tenant(TENANT)
+    assert len(rows) == 2
+    assert [row.created_at for row in rows] == sorted(
+        (row.created_at for row in rows), reverse=True
+    )
+    assert len(deliverable_store.list_for_tenant(TENANT, limit=1)) == 1
+    assert len(deliverable_store.list_for_tenant("snowlinedev")) == 1
+    assert deliverable_store.list_for_tenant("nobody") == []
+    # The listing carries the versions too — §11 reads it to show what each
+    # deliverable reflects, §8 compares them, and a listing that dropped them
+    # would need a second query per row.
+    assert all(row.source_versions for row in rows)
+
+
+def test_list_for_tenant_breaks_ties_by_the_natural_key():
+    # The tie-break is what makes the order TOTAL — a paged listing over a
+    # partial order can repeat or skip a row when several deliverables share a
+    # timestamp. In-memory only because it takes a FROZEN clock to force the
+    # tie: the real store's `func.now()` is per transaction, and each upsert is
+    # its own.
+    store = InMemoryDeliverables(clock=lambda: PRODUCED_AT)
+    for channel in ("website", "app_store", "blog"):
+        _listing(store, channel=channel)
+    rows = store.list_for_tenant(TENANT)
+    assert [row.channel for row in rows] == ["website", "blog", "app_store"]
+
+
 # --- DB-only: the constraints and the §11 listing -----------------------------
+
+
+def test_db_listing_breaks_a_real_timestamp_tie_by_the_natural_key(migrated_db):
+    # The in-memory twin proves the tie-break with a frozen clock; the real
+    # store's `func.now()` is per transaction, so the tie is forced the only
+    # way Postgres allows — raw inserts with an explicit `created_at`,
+    # bypassing the upsert's server-side default — and the ORDER BY's tie
+    # columns are exercised against the database itself, not a Python sort
+    # imitating them.
+    tied = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    with session_scope() as session:
+        for channel in ("website", "app_store", "blog"):
+            session.execute(
+                sa.insert(DeliverableRow).values(
+                    tenant=TENANT,
+                    item_ref=ITEM,
+                    channel=channel,
+                    deliverable_class="store_listing",
+                    produced_at=PRODUCED_AT,
+                    event_id="pm-evt-0000501",
+                    created_at=tied,
+                )
+            )
+    rows = DeliverableProvenanceLedger().list_for_tenant(TENANT)
+    assert [row.channel for row in rows] == ["website", "blog", "app_store"]
 
 
 def test_a_source_version_cannot_outlive_its_deliverable(migrated_db):
@@ -286,25 +346,6 @@ def test_deleting_a_deliverable_takes_its_versions_with_it(migrated_db):
         )
     with session_scope() as session:
         assert session.scalars(sa.select(SourceVersionRow)).all() == []
-
-
-def test_list_for_tenant_is_newest_first_and_isolated(migrated_db):
-    ledger = DeliverableProvenanceLedger()
-    _listing(ledger)
-    _listing(ledger, item_ref="mkt-item-0009", event_id="pm-evt-9")
-    _listing(ledger, tenant="snowlinedev", event_id="pm-evt-other")
-    rows = ledger.list_for_tenant(TENANT)
-    assert len(rows) == 2
-    assert [row.created_at for row in rows] == sorted(
-        (row.created_at for row in rows), reverse=True
-    )
-    assert len(ledger.list_for_tenant(TENANT, limit=1)) == 1
-    assert len(ledger.list_for_tenant("snowlinedev")) == 1
-    assert ledger.list_for_tenant("nobody") == []
-    # The listing carries the versions too — §11 reads it to show what each
-    # deliverable reflects, and a listing that dropped them would need a second
-    # query per row.
-    assert all(row.source_versions for row in rows)
 
 
 def test_listings_fetch_the_version_sets_in_one_query(migrated_db):

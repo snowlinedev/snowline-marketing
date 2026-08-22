@@ -335,13 +335,15 @@ class DeliverableProvenanceLedger:
         self, tenant: str, *, limit: int | None = None
     ) -> list[DeliverableRecord]:
         """One tenant's deliverables, newest first — §11's provenance listing
-        (the input to "staleness overview per channel"). Rides
+        (the input to "staleness overview per channel") and §8's staleness
+        sweep's input (`staleness.sweep_staleness`). Rides
         `ix_deliverable_provenance_tenant_created_at`; the natural key breaks
         ties so the order is total and a paged listing cannot repeat or skip a
         row when several deliverables share a timestamp.
 
-        DB-only, like the delivery ledger's listings: the dashboard reads
-        Postgres, and an in-memory store has no dashboard to serve."""
+        Answered by BOTH stores, unlike the delivery ledger's dashboard
+        listings: the sweep runs fixtures-first (spec §5), so a read only
+        Postgres could answer would leave §8 with no fixtures-first path."""
         statement = (
             select(DeliverableRow)
             .where(DeliverableRow.tenant == tenant)
@@ -451,10 +453,12 @@ class InMemoryDeliverables:
     row's `produced_at` on the same `<=` guard — the things a re-delivered
     completion's behaviour depends on.
 
-    The LISTING surface stays partly DB-only (`list_for_tenant`): that exists for
-    §11's dashboard, which reads Postgres. `list_for_item` is here because it is
-    not a dashboard read — it is how a caller (and the acceptance criteria) asks
-    what a completion produced.
+    The READ surface is here in full, and each read earns its place rather than
+    being mirrored for symmetry: `list_for_item` is how a caller (and the
+    acceptance criteria) asks what a completion produced, and `list_for_tenant`
+    is §8's staleness sweep's INPUT — both are things the fixtures-first flow
+    has to be able to answer with no database. Only the reads that exist purely
+    for §11's Postgres-backed dashboard would stay DB-only.
 
     Not thread-safe, unlike the real store, whose uniqueness the DATABASE
     enforces: a fixtures run is one caller driving one capture in one thread.
@@ -533,3 +537,36 @@ class InMemoryDeliverables:
             ),
             key=lambda record: record.identity,
         )
+
+    def list_for_tenant(
+        self, tenant: str, *, limit: int | None = None
+    ) -> list[DeliverableRecord]:
+        """See `DeliverableProvenanceLedger.list_for_tenant` — same newest-first
+        order, same total tie-break, so a caller asserting on the sequence
+        asserts the same thing on both.
+
+        Present here despite the class docstring's rule that LISTINGS stay
+        DB-only, for `ledger.InMemoryDeliveryLedger.created_for_item`'s reason:
+        this stopped being only a dashboard read when §8's staleness sweep
+        landed. The sweep's INPUT is "every deliverable this tenant has
+        recorded" (`staleness.sweep_staleness`), and the fixtures-first flow
+        (spec §5) is where that sweep is developed and where §14's staleness
+        criteria are checked — a read the in-memory store could not answer would
+        mean the sweep had no fixtures-first path at all.
+
+        The ordering is the real store's, not the insertion order that would be
+        cheaper here: the sweep sorts its own input by natural key precisely so
+        it cannot depend on this, but a listing that disagreed between the two
+        stores would make every OTHER caller's behaviour depend on which store
+        it held."""
+        rows = sorted(
+            (record for record in self._rows.values() if record.tenant == tenant),
+            # `identity` rather than a hand-rolled tuple, exactly as
+            # `list_for_item` sorts: if the natural key ever gains or reorders
+            # a field, both listings and the DB store's ORDER BY move together
+            # instead of this copy silently drifting. Tenant is constant under
+            # the filter, so its presence in the key is inert.
+            key=lambda record: (record.created_at, *record.identity),
+            reverse=True,
+        )
+        return rows if limit is None else rows[: max(0, limit)]

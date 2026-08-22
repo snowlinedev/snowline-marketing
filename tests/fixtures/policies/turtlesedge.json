@@ -122,6 +122,37 @@
       "mode": "dry_run"
     },
     {
+      "policy_id": "review-sweep-on-stale-deliverable",
+      "event_types": ["semantic_signal"],
+      "predicates": {
+        "scope": ["turtlesedge/*"],
+        "signals": ["deliverable-stale"]
+      },
+      "consequence": "review_sweep",
+      "destination": {
+        "scope": "turtlesedge/marketing",
+        "initiative": "monthly-loop"
+      },
+      "title_template": "Refresh the {details.deliverable_class} on {details.deliverable_channel} — its sources moved",
+      "body_template": "The {details.deliverable_class} recorded for {entity_id} on {details.deliverable_channel} reflects {details.recorded_versions}; governance now holds {details.current_versions}.\n\nCompared: {details.comparison}\nRecorded by completion {details.deliverable_event_id}, produced {details.deliverable_produced_at}.",
+      "human_owned": true
+    },
+    {
+      "policy_id": "screenshot-review-on-stale-screenshots",
+      "event_types": ["semantic_signal"],
+      "predicates": {
+        "scope": ["turtlesedge/*"],
+        "signals": ["deliverable-stale:screenshot_set"]
+      },
+      "consequence": "screenshot_review",
+      "destination": {
+        "scope": "turtlesedge/marketing"
+      },
+      "title_template": "Recapture the screenshot set for {entity_id}",
+      "body_template": "The screenshot set on {details.deliverable_channel} reflects {details.recorded_versions}; governance now holds {details.current_versions}. Compared: {details.comparison}. Capture happens in the asset plugin — this item tracks the review.",
+      "human_owned": true
+    },
+    {
       "policy_id": "app-store-listing-publish",
       "event_types": ["milestone_released"],
       "predicates": {
