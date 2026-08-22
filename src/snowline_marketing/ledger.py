@@ -791,6 +791,35 @@ class DeliveryLedger(_LedgerTransitions):
         with session_scope() as session:
             return [_to_record(row) for row in session.scalars(statement)]
 
+    def created_for_item(self, tenant: str, item_ref: str) -> list[LedgerRecord]:
+        """The `created` rows naming `item_ref`, oldest first — the provenance
+        watch's join (spec §8).
+
+        This is the authoritative answer to "did this plugin mint the item that
+        just completed?". The ref was written at mint time (`confirm_created`,
+        §7), so a completion whose subject id matches one of these rows is a
+        marketing-minted completion and the watch's business; one that matches
+        nothing is ordinary roadmap work and is passed through untouched
+        (`watch.py`).
+
+        A LIST, not an optional single row: nothing in the schema promises one
+        created row per item ref (two policies could mint items PM deduplicated
+        to one), and a read that silently picked one of several would decide
+        that question in the least visible place. The watch needs only "at least
+        one"; the rows are ordered so a caller wanting the ORIGINATING delivery
+        gets the first deterministically. Rides the partial
+        `ix_delivery_ledger_tenant_created_item_ref`."""
+        statement = (
+            select(DeliveryLedgerRow)
+            .where(
+                DeliveryLedgerRow.tenant == tenant,
+                DeliveryLedgerRow.created_item_ref == item_ref,
+            )
+            .order_by(DeliveryLedgerRow.created_at, DeliveryLedgerRow.dedup_key)
+        )
+        with session_scope() as session:
+            return [_to_record(row) for row in session.scalars(statement)]
+
     def for_event(self, tenant: str, event_id: str) -> list[LedgerRecord]:
         """Every row this event produced, oldest first — "what happened to
         event X?", which is where an operator conversation starts and which the
@@ -969,3 +998,22 @@ class InMemoryDeliveryLedger(_LedgerTransitions):
         """See `DeliveryLedger.get`. Takes the STORED (namespaced) key. A
         trivial keyed lookup with no ordering promise."""
         return self._rows.get((tenant, dedup_key))
+
+    def created_for_item(self, tenant: str, item_ref: str) -> list[LedgerRecord]:
+        """See `DeliveryLedger.created_for_item` — same ordering, so the watch's
+        join answers identically on both stores.
+
+        Present here despite the class docstring's rule that LISTINGS stay
+        DB-only, because this is not a listing: it is the provenance watch's
+        per-completion JOIN (spec §8), on the hot path of every event, and the
+        fixtures-first flow (spec §5) is where that watch is developed and where
+        §14's acceptance criteria are checked. A join the dry-run store could not
+        answer would mean the watch had no fixtures-first path at all."""
+        return sorted(
+            (
+                record
+                for record in self._rows.values()
+                if record.tenant == tenant and record.created_item_ref == item_ref
+            ),
+            key=lambda record: (record.created_at, record.dedup_key),
+        )

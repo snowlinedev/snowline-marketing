@@ -7,9 +7,11 @@ point at a disposable database and avoids connecting just by importing the
 package.
 
 The models so far are the intake `ConsumerCursor`, the `CachedPolicySet` policy
-cache and the `DeliveryLedgerEntry` delivery ledger (spec §4); the provenance
-and quarantine tables arrive with their own items. Everything here is
-model-agnostic — it owns connections, not schema.
+cache, the `DeliveryLedgerEntry` delivery ledger, the `DeliverableProvenanceEntry`
+(+ `DeliverableSourceVersion`) provenance ledger and the
+`CompletionQuarantineEntry` completion quarantine (spec §4); the malformed-event
+quarantine arrives with the operator surfaces that read it (§11). Everything
+here is model-agnostic — it owns connections, not schema.
 """
 
 from __future__ import annotations

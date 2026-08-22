@@ -5,9 +5,21 @@ event source, holding how far the intake loop has acknowledged.
 `CachedPolicySet` (spec §4, "Policy cache") is the second: one row per resolved
 governance artifact VERSION. `DeliveryLedgerEntry` (spec §4, "Delivery ledger")
 is the third: one row per consumed event × matched policy, and the row whose
-uniqueness makes at-least-once delivery converge. The rest of §4 — deliverable
-provenance ledger, quarantine — arrives with the provenance items; each is a
-separate migration on this chain.
+uniqueness makes at-least-once delivery converge. `DeliverableProvenanceEntry` +
+`DeliverableSourceVersion` (spec §4, "Deliverable provenance ledger") are the
+fourth: one row per deliverable instance, with its source artifact versions in
+an association table rather than a JSON column (see the class docstrings).
+`CompletionQuarantineEntry` (spec §4, "Quarantine") is the fifth: one row per
+provenance-less completion of a marketing-minted item. Each landed as a separate
+migration on this chain.
+
+The MALFORMED-EVENT half of §4's quarantine bullet is deliberately NOT here:
+an unparseable envelope has, by construction, no tenant and possibly no event
+id, its identity is the source's `(source_key, position)` pair
+(`intake.run_intake`'s `on_malformed` seam says so), and its operator verb is
+requeue-the-raw-bytes rather than attach-provenance. Two different keys and two
+different verbs are two tables; the malformed-event one lands with the operator
+surfaces that read it (spec §11).
 
 The cursor lives in MARKETING's own database, not in the source's. That is the
 whole point of at-least-once consumption: the producer (PM's outbox) owns what
@@ -20,7 +32,16 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Index, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKeyConstraint,
+    Index,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -54,6 +75,22 @@ DELIVERY_OUTCOME_VALUES = frozenset(
 # The CHECK expression, derived (sorted, so the rendered SQL is deterministic).
 _DELIVERY_OUTCOME_CHECK = (
     "outcome IN (" + ", ".join(f"'{v}'" for v in sorted(DELIVERY_OUTCOME_VALUES)) + ")"
+)
+
+# The completion-quarantine vocabularies, declared ONCE here for the same
+# reason the delivery outcomes are: the CHECK constraints below are built from
+# them and `quarantine.QuarantineReason` / `quarantine.QuarantineStatus` are
+# pinned against them at import time, so a value cannot be admitted on one side
+# and dropped on the other. (The migrations keep their own literal copies — a
+# migration describes the schema as of ITS revision.)
+QUARANTINE_REASON_VALUES = frozenset({"provenance_missing", "provenance_malformed"})
+QUARANTINE_STATUS_VALUES = frozenset({"open", "resolved", "dismissed"})
+
+_QUARANTINE_REASON_CHECK = (
+    "reason IN (" + ", ".join(f"'{v}'" for v in sorted(QUARANTINE_REASON_VALUES)) + ")"
+)
+_QUARANTINE_STATUS_CHECK = (
+    "status IN (" + ", ".join(f"'{v}'" for v in sorted(QUARANTINE_STATUS_VALUES)) + ")"
 )
 
 
@@ -362,9 +399,305 @@ class DeliveryLedgerEntry(Base):
         # one a support conversation starts from. Not answerable from the key:
         # a custom dedup template need not contain the event id at all.
         Index("ix_delivery_ledger_tenant_event_id", "tenant", "event_id"),
+        # The provenance watch's join (spec §8): "did this plugin mint the item
+        # that just completed?". PARTIAL, because only `created` rows carry a
+        # ref (see `ck_delivery_ledger_created_item_ref`) and they are the
+        # minority of a table that also holds every ignored, deduplicated and
+        # quarantined delivery — so the index covers exactly the rows the join
+        # can match. Not unique: nothing here promises one created row per item
+        # ref, and the watch only needs "at least one".
+        Index(
+            "ix_delivery_ledger_tenant_created_item_ref",
+            "tenant",
+            "created_item_ref",
+            postgresql_where=text("created_item_ref IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
             f"<DeliveryLedgerEntry {self.tenant!r} {self.dedup_key!r} {self.outcome}>"
+        )
+
+
+class DeliverableProvenanceEntry(Base):
+    """One deliverable instance (spec §4, "Deliverable provenance ledger").
+
+    What §8's staleness sweep reads. A row says: this producing PM item, on this
+    channel, produced this class of deliverable, from these source artifact
+    versions, at this time, at this URL — so the sweep can ask its one question
+    ("is the version this deliverable reflects still the current one?") without
+    re-deriving anything from event history.
+
+    **The natural key is `tenant + item_ref + channel + deliverable_class`.**
+    Same posture as every other table here: when the natural key IS the
+    identity, no writer can produce two rows for one logical deliverable. The
+    producing ITEM rather than the producing EVENT is deliberate — an item that
+    is reopened and completed again re-declares the SAME deliverable, and keying
+    on the event id would leave the roadmap holding two rows for one listing,
+    one of them silently stale. `event_id` is therefore a column: which
+    completion last declared this, not which one owns the row.
+
+    **Why an association table and not a JSON column** (see
+    `DeliverableSourceVersion`): the sweep's access path is per source artifact
+    version, so the version ids are QUERYABLE FACTS, and this schema's own rule
+    — stated at `CachedPolicySet.body`, where Text beats JSONB precisely because
+    nothing queries INTO it — cuts the other way here.
+    """
+
+    __tablename__ = "deliverable_provenance"
+
+    # The isolation boundary and the first component of the key, String(255)
+    # like every other tenant column here: an org scope slug, not free text.
+    tenant: Mapped[str] = mapped_column(String(255), primary_key=True)
+
+    # The PM item whose completion produced this deliverable — the same ref the
+    # delivery ledger's `created_item_ref` holds, which is the join that made
+    # the completion recognizable as marketing-minted in the first place
+    # (`watch.py`). Text, not a bounded String: PM owns the shape of a ref.
+    item_ref: Mapped[str] = mapped_column(Text, primary_key=True)
+
+    # Channel and deliverable class, as the completion declared them. Open
+    # vocabulary (`policies.PolicyEntry` keeps its `channels` /
+    # `deliverable_classes` open too — channels grow with §12's adapters and
+    # classes are tenant vocabulary), so these are bounded only against a
+    # producer writing a paragraph into a key column.
+    channel: Mapped[str] = mapped_column(String(128), primary_key=True)
+    deliverable_class: Mapped[str] = mapped_column(String(128), primary_key=True)
+
+    # The completion event that last declared this deliverable. Not part of the
+    # key (see the class docstring) and not unique: one completion declaring a
+    # listing update AND a screenshot set writes two rows carrying it.
+    event_id: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Where the deliverable can be seen. Nullable on purpose: a screenshot set
+    # produced by the asset plugin may have no public URL yet, and refusing to
+    # record an otherwise-complete declaration over it would push an honest
+    # completion into a quarantine queue meant for MISSING provenance.
+    external_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # When the producing work completed — the completion event's `occurred_at`,
+    # never a producer-declared time (see `provenance.py`). timestamptz like
+    # every timestamp here: §8 compares this against release milestone events,
+    # and an ordering argument in local wall time is not an argument.
+    produced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    # When this row was first recorded, and when a later completion last
+    # re-declared it. `created_at` never moves — a re-delivery must be visible
+    # as convergence rather than as a fresh deliverable — so `updated_at` is the
+    # only column that can answer "when did we last hear about this?". NULL
+    # until the first re-declaration, exactly like the delivery ledger's.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        # §11's per-tenant listing ("what has this tenant recorded, newest
+        # first"). The primary key already indexes `tenant` as its leading
+        # column, so this exists purely for the ORDERING.
+        Index("ix_deliverable_provenance_tenant_created_at", "tenant", "created_at"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"<DeliverableProvenanceEntry {self.tenant!r} {self.item_ref!r} "
+            f"{self.channel}/{self.deliverable_class}>"
+        )
+
+
+class DeliverableSourceVersion(Base):
+    """One source artifact version a deliverable was produced FROM (spec §4:
+    "source artifact version ids (carrying their milestone stamps)").
+
+    **Why this is a table and not a JSON column on the deliverable row.** Spec
+    §8's sweep compares "source artifact current version vs the version recorded
+    in deliverable provenance", per version id — so the question it asks is
+    "which deliverables cite artifact X, and at what version?". As rows that is
+    an indexed lookup (`ix_deliverable_source_versions_artifact`) with the
+    version and its milestone stamp in typed columns the database can constrain;
+    as a JSONB array it is a containment query against a GIN index, with the
+    stamp living in a document nothing checks the shape of. The one argument for
+    JSON here — round-trip fidelity to a producer's bytes, which is why
+    `CachedPolicySet.body` is Text — does not apply: the WHOLE declaration is
+    already kept verbatim on any completion that failed to parse
+    (`CompletionQuarantineEntry.raw_event`), so nothing is lost by storing the
+    parsed facts as facts.
+
+    **One version per artifact per deliverable**, enforced by the key: a
+    deliverable claiming artifact A at both v1 and v2 cannot answer the sweep's
+    only question, so `provenance.py` refuses the payload and the key makes the
+    refusal structural rather than merely diligent.
+    """
+
+    __tablename__ = "deliverable_source_versions"
+
+    # The parent's whole natural key, repeated — the cost of keying the parent
+    # naturally rather than on a surrogate id. Paid deliberately: a surrogate
+    # would buy one narrower FK and give up the property every other table here
+    # holds, that one logical thing cannot be written twice.
+    tenant: Mapped[str] = mapped_column(String(255), primary_key=True)
+    item_ref: Mapped[str] = mapped_column(Text, primary_key=True)
+    channel: Mapped[str] = mapped_column(String(128), primary_key=True)
+    deliverable_class: Mapped[str] = mapped_column(String(128), primary_key=True)
+
+    # The governance artifact, and the version of it this deliverable reflects.
+    artifact_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    version_id: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Snowline#141's release stamp on the artifact version, when the producer
+    # knew it. NULL is legitimate and expected: spec §13 says the sweep "works
+    # without stamps (version compare only), better with", so requiring one
+    # would make today's honest payload unstorable.
+    milestone: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant", "item_ref", "channel", "deliverable_class"],
+            [
+                "deliverable_provenance.tenant",
+                "deliverable_provenance.item_ref",
+                "deliverable_provenance.channel",
+                "deliverable_provenance.deliverable_class",
+            ],
+            name="fk_deliverable_source_versions_deliverable",
+            # A source version with no deliverable is a fact about nothing. The
+            # store never deletes a deliverable, so this exists for the operator
+            # who has to remove one by hand.
+            ondelete="CASCADE",
+        ),
+        # The §8 sweep's access path, and the whole reason these are rows: "every
+        # deliverable citing artifact X". Per tenant, because the sweep runs per
+        # tenant and a cross-tenant scan is a boundary this schema does not offer.
+        Index("ix_deliverable_source_versions_artifact", "tenant", "artifact_id"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"<DeliverableSourceVersion {self.artifact_id!r}@{self.version_id!r} "
+            f"for {self.item_ref!r} {self.channel}/{self.deliverable_class}>"
+        )
+
+
+class CompletionQuarantineEntry(Base):
+    """One completion of a marketing-minted item that recorded no deliverable
+    (spec §4, "Quarantine"; spec §8's watch-and-quarantine).
+
+    Spec §8: "a completion without one lands in quarantine — visible, auditable,
+    resolvable by attaching provenance after the fact. No hard completion gate,
+    no friction on the PM verb itself." This table is the "visible" and the
+    "auditable"; `quarantine.py`'s guarded verbs are the "resolvable".
+
+    **The natural key is `tenant + event_id`.** The event id is the plugin's
+    dedup key everywhere else (§4's logical key names it), so at-least-once
+    re-delivery of the same completion converges to ONE row — spec §14's
+    quarantine criterion, spelled the same way the delivery ledger spells
+    duplicate delivery. Keying on the ITEM instead was the alternative and is
+    wrong for one reason that matters: a row an operator has already resolved or
+    dismissed would silently absorb a LATER provenance-less completion of the
+    same item, and an observation swallowed by a closed row is exactly the silent
+    loss quarantine exists to prevent. `item_ref` is indexed instead, so "what is
+    unrecorded about this item?" is still one query.
+
+    **The raw event is kept whole** because the resolve verb reads it: an
+    operator attaching provenance after the fact needs to see what the completion
+    actually said. Text rather than JSONB, for `CachedPolicySet.body`'s reason —
+    JSONB reorders keys, drops duplicates and renormalizes numbers, so a stored
+    event could no longer be compared with what the producer sent, which is the
+    question asked of exactly these rows.
+    """
+
+    __tablename__ = "completion_quarantine"
+
+    tenant: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+
+    # The marketing-minted PM item whose completion this was — the delivery
+    # ledger's `created_item_ref`, which is what identified the completion as
+    # this plugin's business at all (`watch.py`). Also what the resolve verb
+    # keys the deliverable rows it writes on.
+    item_ref: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Why it is here (`quarantine.QuarantineReason`) and the operator-visible
+    # specifics — which key was absent, which field of the sub-document did not
+    # validate. Both required: a quarantine row with no reason is an operator
+    # staring at a refusal with nothing to fix, the same invariant
+    # `policy_cache` and `delivery_ledger` already hold.
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # The completion event, whole (see the class docstring).
+    raw_event: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # open / resolved / dismissed (`quarantine.QuarantineStatus`). A plain
+    # String with an app-side enum plus a value CHECK rather than a native PG
+    # ENUM, for the reason `delivery_ledger.outcome` gives: growing the
+    # vocabulary must not be an ALTER TYPE that cannot run in a transaction. The
+    # CHECK earns its cost because §11's dashboard FILTERS on this column.
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="open"
+    )
+
+    # What the operator said when they closed it — the provenance they attached,
+    # or the judgment that there was no deliverable to record. Required exactly
+    # when the row is closed (see the CHECK): a closed row that cannot say who
+    # closed it and why is an audit trail that stops at the interesting part.
+    resolution_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # When the completion happened (the envelope's `occurred_at`), as distinct
+    # from when this plugin recorded it. Kept because "the item completed three
+    # weeks ago and nothing was ever recorded" is the sentence this queue exists
+    # to make sayable.
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # NULL until the row is resolved or dismissed — the only column that can say
+    # how long a row waited, since `created_at` deliberately never moves. No ORM
+    # `onupdate`, like every other table here: the only writers are the guarded
+    # single-statement UPDATEs in `quarantine._QuarantineTransitions`.
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            _QUARANTINE_REASON_CHECK, name="ck_completion_quarantine_reason"
+        ),
+        CheckConstraint(
+            _QUARANTINE_STATUS_CHECK, name="ck_completion_quarantine_status"
+        ),
+        # Both directions: an open row that already carries a resolution is a
+        # row someone closed without saying so, and a closed row with none is a
+        # decision with no author.
+        CheckConstraint(
+            "(status = 'open') = (resolution_detail IS NULL)",
+            name="ck_completion_quarantine_resolution_detail",
+        ),
+        # §11's queue: "this tenant's open quarantine, oldest first". Oldest
+        # first because the queue is worked from the front and because "how long
+        # has this been unrecorded?" is what makes it a queue at all.
+        Index(
+            "ix_completion_quarantine_tenant_status",
+            "tenant",
+            "status",
+            "created_at",
+        ),
+        # "What is unrecorded about this item?" — the question the item-keyed
+        # alternative would have answered by construction, restored as an index
+        # (see the class docstring on why the key is the event).
+        Index("ix_completion_quarantine_tenant_item_ref", "tenant", "item_ref"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"<CompletionQuarantineEntry {self.tenant!r} {self.event_id!r} "
+            f"{self.status}>"
         )

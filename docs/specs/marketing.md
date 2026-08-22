@@ -71,10 +71,34 @@ Edge is the first configuration, Snowline itself is the intended second.
   convergent; re-delivery returns the existing result.
 - **Deliverable provenance ledger** — one row per deliverable instance:
   channel, deliverable class, source artifact version ids (carrying their
-  milestone stamps), producing item ref, produced_at, external URL.
-- **Quarantine** — malformed/unmapped events and provenance-missing
-  completions, each with an operator-visible reason and requeue/dismiss
-  verbs.
+  milestone stamps), producing item ref, produced_at, external URL. Logical
+  key `tenant + producing item ref + channel + deliverable class` — the
+  producing ITEM, not the producing event, so an item reopened and completed
+  again re-declares one deliverable rather than accumulating a row per
+  completion. The write is an UPSERT, deliberately unlike the delivery
+  ledger's: that row is a claim on work that may already have been done, while
+  this one is a statement of fact about what was produced, so the latest
+  declaration is the truth and a re-delivery converges onto it. Source
+  artifact versions live in an association table — one row per artifact, one
+  version per artifact per deliverable, with its milestone stamp — rather than
+  a JSON column, because §8's sweep compares PER version id and those ids are
+  therefore queryable facts. `produced_at` is the completion event's
+  `occurred_at`, never a producer-declared time.
+- **Quarantine** — two populations, one operator surface, separate storage.
+  Provenance-missing (and provenance-malformed) COMPLETIONS of
+  marketing-minted items key on `tenant + event id`, so at-least-once
+  re-delivery converges to one open row and a row an operator already closed
+  can never be silently reopened by the stream; each keeps the completion
+  event whole and carries an operator-visible reason plus status
+  open/resolved/dismissed. Both closing verbs are guarded transitions:
+  `resolve` attaches provenance after the fact — writing the deliverable rows
+  FIRST and closing second, so a crash between them converges — and `dismiss`
+  records the judgment that there was no deliverable. Malformed/unmapped
+  EVENTS are the second population and a separate table: an unparseable
+  envelope may carry no tenant and no event id at all, so its identity is the
+  source's `(source_key, position)` and its verb is requeue-the-raw-bytes. It
+  lands with the §11 surfaces that read it; the intake loop's `on_malformed`
+  seam is the durable handoff until then.
 - **Policy cache** — resolved policy bodies keyed by governance artifact
   version id; the ledger records the exact version evaluated.
 - **Cursor state** — per-source consumer cursors (PM outbox cursor,
@@ -156,6 +180,23 @@ provenance payload (channel, deliverable class, source artifact versions,
 URL) upserts the deliverable ledger; a completion without one lands in
 quarantine — visible, auditable, resolvable by attaching provenance after
 the fact. No hard completion gate, no friction on the PM verb itself.
+
+The watch recognizes a marketing-minted completion by the DELIVERY LEDGER's
+`created_item_ref` — the ref written at mint time (§7), and the authoritative
+statement that this plugin created that item. Completions whose subject matches
+no `created` row are ordinary roadmap work and pass through silently: the
+plugin consumes the whole lifecycle stream (§5), so most completions it sees
+belong to other people's work. The provenance payload rides
+`payload.details.deliverable_provenance` — a versioned sub-document in the
+free-form half of the envelope (§5), listing one or more deliverables (one
+completion may have produced a listing update AND a screenshot set) — and is
+read with the house never-raises classification: a malformed declaration is
+quarantine-with-a-reason-naming-the-defect, never a crash and never silently
+treated as absent. The watch runs as a handler in the same per-event,
+before-the-ack composition minting uses, so an acked completion is one whose
+deliverable rows (or quarantine row) are durable; a watch store failure stalls
+the pass and the completion re-delivers, because the watch may never DROP an
+observation even though it may never BLOCK a completion.
 
 The staleness sweep compares, per channel/deliverable class:
 

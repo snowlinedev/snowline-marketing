@@ -38,9 +38,12 @@ quarantine, operator-visible, requeuable), and it must not wedge the stream —
 retrying a permanently-unparseable envelope forever would stop every valid
 event behind it, turning one bad producer write into a dead pipeline. So v1:
 report it through `on_malformed`, advance the cursor past it, keep going. The
-report is the durable handoff — the quarantine STORE (a later item) is what
-persists it; until that lands, `on_malformed` defaults to a WARNING log so a
-malformed event is at least loud rather than invisible. Note the residual
+report is the durable handoff — the malformed-event quarantine STORE (a later
+item, landing with the §11 surfaces that read it; `quarantine.py` holds the
+provenance-missing half of §4's quarantine bullet and deliberately not this
+one) is what persists it. Until that lands, `on_malformed` defaults to a
+WARNING log so a malformed event is at least loud rather than invisible. Note
+the residual
 window this leaves: a crash between the malformed report and the ack
 re-delivers the malformed envelope, so the quarantine store must upsert on
 (source_key, position) rather than insert blindly — the same idempotency the

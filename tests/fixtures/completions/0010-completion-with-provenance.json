@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000501",
+  "event_type": "item_completed",
+  "tenant": "turtlesedge",
+  "occurred_at": "2026-07-28T09:14:00+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "mkt-item-0001"
+  },
+  "payload": {
+    "scope": "turtlesedge/marketing",
+    "initiative": "app-store",
+    "phase": "release",
+    "milestone": "v1.4",
+    "work_kind": "marketing",
+    "details": {
+      "title": "Regenerate the App Store listing for v1.4",
+      "deliverable_provenance": {
+        "schema_version": 1,
+        "deliverables": [
+          {
+            "channel": "app_store",
+            "deliverable_class": "store_listing",
+            "source_artifact_versions": [
+              {
+                "artifact_id": "b964d217",
+                "version_id": "av-3c81f9d2",
+                "milestone": "v1.4"
+              },
+              {
+                "artifact_id": "9f21ac04",
+                "version_id": "av-77b0e315"
+              }
+            ],
+            "external_url": "https://apps.apple.com/app/turtletracks/id6470000000"
+          },
+          {
+            "channel": "app_store",
+            "deliverable_class": "screenshot_set",
+            "source_artifact_versions": [
+              {
+                "artifact_id": "9f21ac04",
+                "version_id": "av-77b0e315",
+                "milestone": "v1.4"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
