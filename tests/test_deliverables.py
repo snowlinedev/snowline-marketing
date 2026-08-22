@@ -72,7 +72,9 @@ def deliverable_store(request):
 
 
 def test_a_deliverable_records_everything_the_sweep_will_need(deliverable_store):
-    record = _listing(deliverable_store)
+    write = _listing(deliverable_store)
+    assert write.applied
+    record = write.record
     assert record.identity == (TENANT, ITEM, "app_store", "store_listing")
     assert record.produced_at == PRODUCED_AT
     assert record.event_id == "pm-evt-0000501"
@@ -93,13 +95,16 @@ def test_a_re_declared_deliverable_converges_onto_one_row(deliverable_store):
     # NOTHING — a deliverable row is a statement of fact, not a claim on work.
     first = _listing(deliverable_store)
     second = _listing(deliverable_store)
-    assert deliverable_store.list_for_item(TENANT, ITEM) == [second]
-    assert second.source_versions == first.source_versions
+    # Equal `produced_at` re-APPLIES: a re-delivery of the same completion is
+    # convergence, not a superseded write.
+    assert first.applied and second.applied
+    assert deliverable_store.list_for_item(TENANT, ITEM) == [second.record]
+    assert second.record.source_versions == first.record.source_versions
     # `created_at` marks the first recording and must not move, so a re-delivery
     # reads as convergence rather than as a fresh deliverable; `updated_at` is
     # what says we heard about it again.
-    assert second.created_at == first.created_at
-    assert second.updated_at is not None
+    assert second.record.created_at == first.record.created_at
+    assert second.record.updated_at is not None
 
 
 def test_a_corrected_declaration_replaces_the_version_it_corrected(deliverable_store):
@@ -116,7 +121,7 @@ def test_a_corrected_declaration_replaces_the_version_it_corrected(deliverable_s
         ),
         event_id="pm-evt-0000600",
         external_url=None,
-    )
+    ).record
     assert [v.version_id for v in corrected.source_versions] == ["av-9911ffee"]
     assert corrected.event_id == "pm-evt-0000600"
     # Nullable facts converge downward too — a correction that removes the URL
@@ -150,7 +155,9 @@ def test_the_same_channel_and_class_under_two_items_are_two_rows(deliverable_sto
     # The producing ITEM is in the key: two marketing items may each own a store
     # listing deliverable, and neither may read back the other's.
     _listing(deliverable_store)
-    other = _listing(deliverable_store, item_ref="mkt-item-0009", event_id="pm-evt-9")
+    other = _listing(
+        deliverable_store, item_ref="mkt-item-0009", event_id="pm-evt-9"
+    ).record
     assert other.item_ref == "mkt-item-0009"
     assert len(deliverable_store.list_for_item(TENANT, ITEM)) == 1
     assert len(deliverable_store.list_for_item(TENANT, "mkt-item-0009")) == 1
@@ -181,6 +188,57 @@ def test_a_deliverable_naming_no_source_version_is_refused(deliverable_store):
     with pytest.raises(ValueError, match="at least one source artifact version"):
         _listing(deliverable_store, source_versions=())
     assert deliverable_store.list_for_item(TENANT, ITEM) == []
+
+
+def test_an_older_declaration_is_refused_as_superseded(deliverable_store):
+    # Newest completion wins, by `produced_at`: an outbox re-delivering an OLD
+    # completion after a newer one recorded must converge as a no-op, not roll
+    # the row's facts back.
+    newer = _listing(deliverable_store)
+    stale = _listing(
+        deliverable_store,
+        produced_at=PRODUCED_AT - timedelta(days=2),
+        event_id="pm-evt-0000400",
+        source_versions=(
+            SourceVersion(artifact_id="b964d217", version_id="av-00stale"),
+        ),
+        external_url=None,
+    )
+    assert newer.applied
+    assert not stale.applied
+    # The refusing row comes back, so the caller can say superseded-by-what —
+    # and the ledger keeps the newer completion's facts whole: row AND version
+    # set (a superseded declaration must not swap the versions either).
+    assert stale.record == newer.record
+    standing = deliverable_store.get(TENANT, ITEM, "app_store", "store_listing")
+    assert standing.event_id == "pm-evt-0000501"
+    assert standing.produced_at == PRODUCED_AT
+    assert [v.version_id for v in standing.source_versions] == [
+        "av-77b0e315",
+        "av-3c81f9d2",
+    ]
+    assert standing.external_url.endswith("id6470000000")
+
+
+def test_a_newer_declaration_still_wins_after_a_refusal(deliverable_store):
+    # The guard is per-write, not a latch: after a stale refusal, a genuinely
+    # newer completion converges the row as ever.
+    _listing(deliverable_store)
+    _listing(
+        deliverable_store,
+        produced_at=PRODUCED_AT - timedelta(days=2),
+        event_id="pm-evt-0000400",
+    )
+    newest = _listing(
+        deliverable_store,
+        produced_at=PRODUCED_AT + timedelta(days=1),
+        event_id="pm-evt-0000700",
+    )
+    assert newest.applied
+    assert (
+        deliverable_store.get(TENANT, ITEM, "app_store", "store_listing").event_id
+        == "pm-evt-0000700"
+    )
 
 
 def test_one_artifact_at_two_versions_is_refused(deliverable_store):
@@ -249,6 +307,35 @@ def test_list_for_tenant_is_newest_first_and_isolated(migrated_db):
     assert all(row.source_versions for row in rows)
 
 
+def test_listings_fetch_the_version_sets_in_one_query(migrated_db):
+    # The association rows for a whole listing come back in ONE query (the
+    # natural keys, IN-listed) and are stitched in memory — a listing must not
+    # cost one version query per deliverable row.
+    from snowline_marketing.db import get_engine
+
+    ledger = DeliverableProvenanceLedger()
+    for index in range(4):
+        _listing(ledger, item_ref=f"mkt-item-100{index}", event_id=f"pm-evt-{index}")
+    statements: list[str] = []
+
+    def record_statement(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sa.event.listen(get_engine(), "before_cursor_execute", record_statement)
+    try:
+        rows = ledger.list_for_tenant(TENANT)
+    finally:
+        sa.event.remove(get_engine(), "before_cursor_execute", record_statement)
+    assert len(rows) == 4
+    # Ordering stays deterministic and every row carries its versions.
+    assert [row.item_ref for row in rows] == sorted(
+        (row.item_ref for row in rows), reverse=True
+    )
+    assert all(row.source_versions for row in rows)
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert len(selects) == 2, selects
+
+
 def test_the_association_rows_are_queryable_by_artifact(migrated_db):
     # The whole reason the versions are rows: §8's sweep asks "which deliverables
     # cite artifact X?", and this is that question as an indexed lookup rather
@@ -285,8 +372,8 @@ def test_the_in_memory_clock_is_injectable():
     later = frozen + timedelta(days=1)
     clock = iter((frozen, later))
     store = InMemoryDeliverables(clock=lambda: next(clock))
-    first = _listing(store)
-    second = _listing(store)
+    first = _listing(store).record
+    second = _listing(store).record
     assert first.created_at == frozen
     assert second.created_at == frozen
     assert second.updated_at == later

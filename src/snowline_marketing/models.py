@@ -648,6 +648,16 @@ class CompletionQuarantineEntry(Base):
     # closed it and why is an audit trail that stops at the interesting part.
     resolution_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # The provenance declaration an operator attached to close this row,
+    # verbatim — persisted BY the open->resolved transition itself, BEFORE the
+    # deliverable rows are written (`watch.resolve_quarantined` closes first),
+    # so a crash between the close and the writes loses nothing: the row
+    # carries what should be applied, and re-invoking the resolve verb
+    # re-applies it idempotently. NULL on rows closed any other way (the
+    # watch's item-keyed self-close credits the recording event instead; a
+    # dismissal attached nothing) — see the CHECK.
+    attached_provenance: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # When the completion happened (the envelope's `occurred_at`), as distinct
     # from when this plugin recorded it. Kept because "the item completed three
     # weeks ago and nothing was ever recorded" is the sentence this queue exists
@@ -659,10 +669,11 @@ class CompletionQuarantineEntry(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    # NULL until the row is resolved or dismissed — the only column that can say
-    # how long a row waited, since `created_at` deliberately never moves. No ORM
-    # `onupdate`, like every other table here: the only writers are the guarded
-    # single-statement UPDATEs in `quarantine._QuarantineTransitions`.
+    # NULL until the row first transitions — resolved, dismissed, or an open
+    # row whose classification the requeue verb refreshed — the only column
+    # that can say how long a row waited, since `created_at` deliberately never
+    # moves. No ORM `onupdate`, like every other table here: the only writers
+    # are the guarded single-statement UPDATEs in `quarantine.py`.
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -680,6 +691,14 @@ class CompletionQuarantineEntry(Base):
         CheckConstraint(
             "(status = 'open') = (resolution_detail IS NULL)",
             name="ck_completion_quarantine_resolution_detail",
+        ),
+        # Only a RESOLVED row may carry an attached declaration: an open or
+        # dismissed row holding one would claim an attachment that closed
+        # nothing, and the healing path (`watch.resolve_quarantined`) trusts
+        # this column as "what the resolve was closing over".
+        CheckConstraint(
+            "attached_provenance IS NULL OR status = 'resolved'",
+            name="ck_completion_quarantine_attached_provenance",
         ),
         # §11's queue: "this tenant's open quarantine, oldest first". Oldest
         # first because the queue is worked from the front and because "how long

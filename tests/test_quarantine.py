@@ -164,6 +164,87 @@ def test_a_re_delivery_cannot_reopen_a_closed_decision(quarantine_store):
     assert quarantine_store.list_open(TENANT) == []
 
 
+def test_resolving_persists_the_attached_declaration_on_the_row(quarantine_store):
+    # The close is the FIRST of the resolve verb's two durable steps
+    # (`watch.resolve_quarantined`), so the declaration must ride the same
+    # guarded statement — it is what the healing path re-applies after a crash
+    # between the close and the deliverable writes.
+    _filed(quarantine_store)
+    declaration = '{"schema_version": 1, "deliverables": []}'
+    transition = quarantine_store.resolve(
+        TENANT, EVENT, detail="attached", attached_provenance=declaration
+    )
+    assert transition.applied
+    assert transition.record.attached_provenance == declaration
+    assert quarantine_store.get(TENANT, EVENT).attached_provenance == declaration
+
+
+def test_a_resolve_attaching_nothing_leaves_the_column_null(quarantine_store):
+    # The watch's self-close and the requeue verb resolve rows whose provenance
+    # the ledger already holds — nothing was attached, and the row says so.
+    _filed(quarantine_store)
+    transition = quarantine_store.resolve(TENANT, EVENT, detail="attached")
+    assert transition.applied
+    assert transition.record.attached_provenance is None
+
+
+def test_resolve_open_for_item_closes_every_open_row_and_only_those(
+    quarantine_store,
+):
+    # The watch's item-keyed self-close: ONE guarded statement, a count back,
+    # no read-back — and an operator's closed decision is untouchable by it.
+    _filed(quarantine_store)
+    _filed(quarantine_store, event_id="pm-evt-0000800")
+    _filed(quarantine_store, event_id="pm-evt-0000801")
+    quarantine_store.dismiss(TENANT, "pm-evt-0000801", detail="nothing produced")
+    _filed(quarantine_store, event_id="pm-evt-0000802", item_ref="some-other-item")
+    closed = quarantine_store.resolve_open_for_item(
+        TENANT, ITEM, detail="provenance recorded by completion pm-evt-0000900"
+    )
+    assert closed == 2
+    resolved = quarantine_store.get(TENANT, EVENT)
+    assert resolved.status is QuarantineStatus.resolved
+    assert "pm-evt-0000900" in resolved.resolution_detail
+    assert resolved.updated_at is not None
+    # The dismissal stands; the other item's row is untouched.
+    assert quarantine_store.get(TENANT, "pm-evt-0000801").status is (
+        QuarantineStatus.dismissed
+    )
+    assert quarantine_store.get(TENANT, "pm-evt-0000802").is_open
+    # Nothing left to close: the common (hot-path) case is a zero count.
+    assert quarantine_store.resolve_open_for_item(TENANT, ITEM, detail="again") == 0
+
+
+def test_refresh_open_updates_the_classification_in_place(quarantine_store):
+    # The requeue verb's store half: an open row re-diagnosed says what is
+    # wrong NOW, stamped, and stays open; a closed row's classification is
+    # settled and refuses.
+    _filed(quarantine_store)
+    refreshed = quarantine_store.refresh_open(
+        TENANT,
+        EVENT,
+        reason=QuarantineReason.provenance_malformed,
+        detail="deliverables.0.channel: Field required",
+    )
+    assert refreshed.applied
+    assert refreshed.record.is_open
+    assert refreshed.record.reason is QuarantineReason.provenance_malformed
+    assert "channel" in refreshed.record.detail
+    assert refreshed.record.updated_at is not None
+    assert refreshed.record.resolution_detail is None
+    quarantine_store.dismiss(TENANT, EVENT, detail="nothing produced")
+    refused = quarantine_store.refresh_open(
+        TENANT, EVENT, reason=QuarantineReason.provenance_missing, detail="again"
+    )
+    assert not refused.applied
+    assert refused.record.status is QuarantineStatus.dismissed
+    absent = quarantine_store.refresh_open(
+        TENANT, "never-filed", reason=QuarantineReason.provenance_missing, detail="x"
+    )
+    assert not absent.applied
+    assert absent.record is None
+
+
 def test_a_verb_on_a_row_that_does_not_exist_reports_neither(quarantine_store):
     transition = quarantine_store.resolve(TENANT, "never-filed", detail="x")
     assert not transition.applied
@@ -241,6 +322,18 @@ def test_an_open_row_cannot_carry_a_resolution_and_a_closed_one_must(migrated_db
     _rejects(resolution_detail="closed without saying so")
     _rejects(status=QuarantineStatus.resolved.value)
     _rejects(status=QuarantineStatus.dismissed.value)
+
+
+def test_only_a_resolved_row_may_carry_an_attached_declaration(migrated_db):
+    # The healing path trusts `attached_provenance` as "what the resolve was
+    # closing over" — an open or dismissed row holding one would claim an
+    # attachment that closed nothing.
+    _rejects(attached_provenance='{"schema_version": 1}')
+    _rejects(
+        status=QuarantineStatus.dismissed.value,
+        resolution_detail="nothing produced",
+        attached_provenance='{"schema_version": 1}',
+    )
 
 
 def test_list_for_item_includes_the_rows_that_were_closed(migrated_db):

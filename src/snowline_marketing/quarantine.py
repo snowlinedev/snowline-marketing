@@ -44,21 +44,32 @@ compare-and-set (`_TRANSITIONS`, applied through `_QuarantineTransitions`) —
 one definition, both stores — so two operators (or an operator and a replay)
 racing one row resolve in the database and exactly one sees `applied=True`.
 
-The two verbs are §8's and §4's, and they are not the same answer:
+The verbs are §8's and §4's, and they are not the same answer:
 
-- `resolve` — provenance was attached after the fact. The deliverable rows are
-  written FIRST and the row is closed second (`watch.resolve_quarantined`), the
-  same durable-fact-before-acknowledgement discipline that makes minting
-  recoverable: a crash in between leaves an open row and a recorded deliverable,
-  and re-running converges.
+- `resolve` — provenance was attached after the fact. The row is closed FIRST
+  — the guarded CAS persists the attached declaration verbatim on the row
+  (`attached_provenance`) — and the deliverable rows are written second, only
+  when the close APPLIED (`watch.resolve_quarantined`): a refused close
+  provably writes nothing, and a crash between the two leaves a resolved row
+  that still carries what to apply, which re-invoking the verb re-applies
+  idempotently.
+- `resolve_open_for_item` — the watch's self-close: a completion that RECORDED
+  provenance closes every open row filed against its item, in ONE guarded
+  UPDATE crediting the recording event. Item-keyed where everything else is
+  event-keyed, because the open row may belong to an EARLIER completion event
+  of the same item; count-only (no read-back), because the common case on the
+  watch's hot path is one UPDATE matching nothing.
+- `refresh_open` — the store half of spec §4's requeue verb
+  (`watch.requeue_quarantined`): re-classifying the stored completion may
+  re-diagnose an open row, and the row should say what is wrong NOW.
 - `dismiss` — operator judgment that there was no deliverable to record (a
   marketing item completed as "no longer needed"). Nothing is written anywhere
   else; the row closes carrying the reason.
 
-Both require a detail. A closed row that cannot say who closed it and why is an
-audit trail that stops at the interesting part, and the database CHECK
-(`ck_completion_quarantine_resolution_detail`) makes that an invariant rather
-than a convention.
+The closing verbs require a detail. A closed row that cannot say who closed it
+and why is an audit trail that stops at the interesting part, and the database
+CHECK (`ck_completion_quarantine_resolution_detail`) makes that an invariant
+rather than a convention.
 """
 
 from __future__ import annotations
@@ -67,13 +78,13 @@ import dataclasses
 import enum
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from snowline_marketing.db import session_scope
+from snowline_marketing.db import session_scope, utc_now
 from snowline_marketing.models import QUARANTINE_REASON_VALUES, QUARANTINE_STATUS_VALUES
 from snowline_marketing.models import CompletionQuarantineEntry as QuarantineRow
 
@@ -140,12 +151,6 @@ if {status.value for status in QuarantineStatus} != QUARANTINE_STATUS_VALUES:
 CLOSED_STATUSES = frozenset({QuarantineStatus.resolved, QuarantineStatus.dismissed})
 
 
-def _utc_now() -> datetime:
-    """`InMemoryCompletionQuarantine`'s default clock — the in-process stand-in
-    for the timestamptz `func.now()` the real store's columns default to."""
-    return datetime.now(timezone.utc)
-
-
 @dataclass(frozen=True)
 class QuarantineRecord:
     """One quarantine row, read back.
@@ -164,6 +169,10 @@ class QuarantineRecord:
     occurred_at: datetime
     created_at: datetime
     resolution_detail: str | None = None
+    # The declaration a resolve attached, verbatim — non-None only on rows the
+    # operator verb closed (`models.CompletionQuarantineEntry` carries the
+    # design; `watch.resolve_quarantined` the healing path that reads it).
+    attached_provenance: str | None = None
     updated_at: datetime | None = None
 
     @property
@@ -248,26 +257,40 @@ class _QuarantineTransitions:
         tenant: str,
         event_id: str,
         detail: str,
+        attached_provenance: str | None = None,
     ) -> QuarantineTransition:  # pragma: no cover - implemented by both stores
         raise NotImplementedError
 
     def resolve(
-        self, tenant: str, event_id: str, *, detail: str
+        self,
+        tenant: str,
+        event_id: str,
+        *,
+        detail: str,
+        attached_provenance: str | None = None,
     ) -> QuarantineTransition:
         """Close an open row as RESOLVED: provenance was attached after the fact
         (spec §8).
 
-        The store-level half of the verb. Writing the deliverable rows is the
-        caller's, and it happens FIRST (`watch.resolve_quarantined`) — a crash
-        between the two leaves an open row beside a recorded deliverable, which
-        re-running converges, whereas closing first would lose the deliverable
-        with the row closed over it.
+        The store-level half of the verb, and the FIRST of the verb's two
+        durable steps: `watch.resolve_quarantined` closes before it writes the
+        deliverable rows, persisting the attached declaration verbatim on the
+        row (`attached_provenance`) in the same guarded statement — so a
+        refused close provably writes nothing, and a crash between the close
+        and the writes leaves a resolved row that still carries what to apply
+        (the healing path re-applies it). `attached_provenance` is None when
+        nothing was attached — the watch's item-keyed self-close and the
+        requeue verb resolve rows whose provenance the ledger already holds.
 
         `detail` is required and is the operator's sentence on the row: what was
         attached, by whom. `applied=False` means the row was already closed;
         read `record.status` to tell resolved from dismissed."""
         return self._apply(
-            _TRANSITIONS["resolve"], tenant=tenant, event_id=event_id, detail=detail
+            _TRANSITIONS["resolve"],
+            tenant=tenant,
+            event_id=event_id,
+            detail=detail,
+            attached_provenance=attached_provenance,
         )
 
     def dismiss(
@@ -319,7 +342,20 @@ class QuarantineStore(Protocol):
     ) -> list[QuarantineRecord]: ...
 
     def resolve(
-        self, tenant: str, event_id: str, *, detail: str
+        self,
+        tenant: str,
+        event_id: str,
+        *,
+        detail: str,
+        attached_provenance: str | None = None,
+    ) -> QuarantineTransition: ...
+
+    def resolve_open_for_item(
+        self, tenant: str, item_ref: str, *, detail: str
+    ) -> int: ...
+
+    def refresh_open(
+        self, tenant: str, event_id: str, *, reason: QuarantineReason, detail: str
     ) -> QuarantineTransition: ...
 
     def dismiss(
@@ -390,6 +426,7 @@ class CompletionQuarantine(_QuarantineTransitions):
         tenant: str,
         event_id: str,
         detail: str,
+        attached_provenance: str | None = None,
     ) -> QuarantineTransition:
         """One guarded compare-and-set (see `_QuarantineTransitions` for the
         verbs).
@@ -397,7 +434,18 @@ class CompletionQuarantine(_QuarantineTransitions):
         The `WHERE` names the legal source statuses, so two closers racing one
         row resolve in the database: one UPDATE matches, the other matches
         nothing. The row is read back in the same transaction regardless,
-        because the refusal path needs the row that refused."""
+        because the refusal path needs the row that refused.
+
+        `attached_provenance` is written only when given (a resolve carrying an
+        operator's declaration), so a dismiss — or a resolve attaching nothing —
+        cannot null out a column it never speaks for."""
+        values: dict[str, object] = {
+            "status": transition.to_status.value,
+            "resolution_detail": detail,
+            "updated_at": func.now(),
+        }
+        if attached_provenance is not None:
+            values["attached_provenance"] = attached_provenance
         statement = (
             update(QuarantineRow)
             .where(
@@ -407,9 +455,67 @@ class CompletionQuarantine(_QuarantineTransitions):
                     sorted(status.value for status in transition.from_statuses)
                 ),
             )
+            .values(**values)
+        )
+        with session_scope() as session:
+            applied = session.execute(statement).rowcount == 1
+            row = session.get(QuarantineRow, (tenant, event_id))
+            return QuarantineTransition(
+                record=_to_record(row) if row is not None else None, applied=applied
+            )
+
+    def resolve_open_for_item(self, tenant: str, item_ref: str, *, detail: str) -> int:
+        """Close EVERY open row filed against `item_ref` as RESOLVED, in one
+        guarded UPDATE, returning the count closed — the watch's self-close for
+        a completion that RECORDED provenance (spec §8, `watch.py`).
+
+        Item-keyed where every other verb is event-keyed, because the open row
+        it settles may belong to an EARLIER completion event of the same item
+        (completed provenance-less, reopened, completed again with provenance);
+        `detail` credits the recording event so the row still says what closed
+        it. The guard is the check: only `open` rows match, so an operator's
+        closed decision is untouchable here exactly as it is in `_apply`.
+
+        Deliberately NO read-back — this runs on the watch's hot path, per
+        recorded completion, and the common case is one UPDATE matching
+        nothing. Rides `ix_completion_quarantine_tenant_item_ref`."""
+        statement = (
+            update(QuarantineRow)
+            .where(
+                QuarantineRow.tenant == tenant,
+                QuarantineRow.item_ref == item_ref,
+                QuarantineRow.status == QuarantineStatus.open.value,
+            )
             .values(
-                status=transition.to_status.value,
+                status=QuarantineStatus.resolved.value,
                 resolution_detail=detail,
+                updated_at=func.now(),
+            )
+        )
+        with session_scope() as session:
+            return session.execute(statement).rowcount
+
+    def refresh_open(
+        self, tenant: str, event_id: str, *, reason: QuarantineReason, detail: str
+    ) -> QuarantineTransition:
+        """Refresh an OPEN row's classification in place — the store half of
+        spec §4's requeue verb (`watch.requeue_quarantined`): re-running the
+        classification over the stored completion may re-diagnose the row (a
+        producer bug fixed into a different one), and the row should say what
+        is wrong NOW, stamped as `updated_at`.
+
+        Guarded like every transition — only open rows; a closed row's
+        classification is settled, and the refusal returns it."""
+        statement = (
+            update(QuarantineRow)
+            .where(
+                QuarantineRow.tenant == tenant,
+                QuarantineRow.event_id == event_id,
+                QuarantineRow.status == QuarantineStatus.open.value,
+            )
+            .values(
+                reason=reason.value,
+                detail=detail,
                 updated_at=func.now(),
             )
         )
@@ -478,6 +584,7 @@ def _to_record(row: QuarantineRow) -> QuarantineRecord:
         occurred_at=row.occurred_at,
         created_at=row.created_at,
         resolution_detail=row.resolution_detail,
+        attached_provenance=row.attached_provenance,
         updated_at=row.updated_at,
     )
 
@@ -501,7 +608,7 @@ class InMemoryCompletionQuarantine(_QuarantineTransitions):
 
     def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
         self._rows: dict[tuple[str, str], QuarantineRecord] = {}
-        self._clock = clock if clock is not None else _utc_now
+        self._clock = clock if clock is not None else utc_now
 
     def record(
         self,
@@ -543,11 +650,13 @@ class InMemoryCompletionQuarantine(_QuarantineTransitions):
         tenant: str,
         event_id: str,
         detail: str,
+        attached_provenance: str | None = None,
     ) -> QuarantineTransition:
         """See `CompletionQuarantine._apply`. The same guard, expressed against
         a dict: the transition applies only from the declared source statuses, so
         a second closer refusing an already-closed row behaves here exactly as
-        the UPDATE's `WHERE` makes it behave in Postgres."""
+        the UPDATE's `WHERE` makes it behave in Postgres. `attached_provenance`
+        lands only when given, same as the real store's conditional SET."""
         existing = self._rows.get((tenant, event_id))
         if existing is None:
             return QuarantineTransition(record=None, applied=False)
@@ -557,7 +666,44 @@ class InMemoryCompletionQuarantine(_QuarantineTransitions):
             existing,
             status=transition.to_status,
             resolution_detail=detail,
+            attached_provenance=(
+                attached_provenance
+                if attached_provenance is not None
+                else existing.attached_provenance
+            ),
             updated_at=self._clock(),
+        )
+        self._rows[(tenant, event_id)] = updated
+        return QuarantineTransition(record=updated, applied=True)
+
+    def resolve_open_for_item(self, tenant: str, item_ref: str, *, detail: str) -> int:
+        """See `CompletionQuarantine.resolve_open_for_item` — the same one-shot
+        guarded close, expressed against the dict, counting what it closed."""
+        closed = 0
+        for key, record in self._rows.items():
+            if record.tenant == tenant and record.item_ref == item_ref:
+                if record.is_open:
+                    self._rows[key] = dataclasses.replace(
+                        record,
+                        status=QuarantineStatus.resolved,
+                        resolution_detail=detail,
+                        updated_at=self._clock(),
+                    )
+                    closed += 1
+        return closed
+
+    def refresh_open(
+        self, tenant: str, event_id: str, *, reason: QuarantineReason, detail: str
+    ) -> QuarantineTransition:
+        """See `CompletionQuarantine.refresh_open` — the same open-only guard,
+        expressed against the dict."""
+        existing = self._rows.get((tenant, event_id))
+        if existing is None:
+            return QuarantineTransition(record=None, applied=False)
+        if not existing.is_open:
+            return QuarantineTransition(record=existing, applied=False)
+        updated = dataclasses.replace(
+            existing, reason=reason, detail=detail, updated_at=self._clock()
         )
         self._rows[(tenant, event_id)] = updated
         return QuarantineTransition(record=updated, applied=True)

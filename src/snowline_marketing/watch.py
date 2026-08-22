@@ -54,10 +54,13 @@ that minted it), so nothing the mint does this pass changes what the watch would
 see.
 
 Everything is convergent under at-least-once re-delivery, which is what makes
-the crash window harmless: the deliverable ledger upserts (a re-declared
-deliverable lands on the same row), and the quarantine files first-writer-wins
-(a re-delivered provenance-less completion converges to ONE open row, and cannot
-reopen a decision an operator already made).
+the crash window harmless: the deliverable ledger upserts newest-completion-
+wins (a re-declared deliverable lands on the same row, and a STALE re-delivery
+arriving after a newer completion recorded is refused per deliverable and
+surfaced as superseded), and the quarantine files first-writer-wins (a
+re-delivered provenance-less completion converges to ONE open row, and cannot
+reopen a decision an operator already made — a completion whose own row was
+already closed skips recording entirely, see `watch_completion`).
 """
 
 from __future__ import annotations
@@ -75,6 +78,7 @@ from snowline_marketing.deliverables import (
     DeliverableProvenanceLedger,
     DeliverableRecord,
     DeliverableStore,
+    DeliverableWrite,
     SourceVersion,
 )
 from snowline_marketing.engine import EvaluationStalled, PolicyResolution
@@ -104,6 +108,7 @@ from snowline_marketing.quarantine import (
     CompletionQuarantine,
     QuarantineReason,
     QuarantineRecord,
+    QuarantineStatus,
     QuarantineStore,
     QuarantineTransition,
 )
@@ -153,6 +158,12 @@ class WatchDisposition(enum.StrEnum):
     # The completed item was never minted by this plugin: ordinary roadmap
     # work, none of the watch's business. Nothing written, nothing logged.
     not_marketing_minted = "not_marketing_minted"
+    # A marketing-minted completion re-delivered with provenance AFTER its own
+    # quarantine row was closed. A dismissed row is an operator's explicit
+    # "nothing was produced" and a resolved one was already applied — either
+    # way the observation is settled, and the re-delivery converges as a quiet
+    # no-op rather than overriding a decision. Nothing written, DEBUG-logged.
+    already_settled = "already_settled"
     # Not an `item_completed` event at all. Every other event type flows through
     # the handler untouched.
     not_a_completion = "not_a_completion"
@@ -172,14 +183,26 @@ class WatchOutcome:
     `minted_by` is the `created` delivery-ledger row that made this completion
     the watch's business — non-None exactly for the dispositions that acted, so
     an operator reading a quarantine row can get from it to the policy that
-    minted the item in the first place."""
+    minted the item in the first place.
+
+    `deliverables` carries the WRITES, not bare records
+    (`deliverables.DeliverableWrite`): a `recorded` outcome may include
+    declarations the ledger refused because a newer completion's facts already
+    stand, and `superseded` is that subset surfaced by name."""
 
     envelope: EventEnvelope
     disposition: WatchDisposition
-    deliverables: tuple[DeliverableRecord, ...] = ()
+    deliverables: tuple[DeliverableWrite, ...] = ()
     quarantine: QuarantineRecord | None = None
     minted_by: LedgerRecord | None = None
     detail: str | None = None
+
+    @property
+    def superseded(self) -> tuple[DeliverableRecord, ...]:
+        """The standing rows that REFUSED this completion's declarations — a
+        stale outbox re-delivery landing after a newer completion recorded
+        converges as exactly these no-ops (`deliverables.DeliverableWrite`)."""
+        return tuple(write.record for write in self.deliverables if not write.applied)
 
     @property
     def tenant(self) -> str:
@@ -267,14 +290,16 @@ def _record_deliverables(
     produced_at: datetime,
     provenance: DeliverableProvenance,
     deliverables: DeliverableStore,
-) -> tuple[DeliverableRecord, ...]:
-    """Upsert every declared deliverable, in declaration order.
+) -> tuple[DeliverableWrite, ...]:
+    """Upsert every declared deliverable, in declaration order — each write
+    reporting whether it applied or was superseded by a newer completion's
+    facts (`deliverables.DeliverableWrite`).
 
-    Shared by the watch and by `resolve_quarantined` so that provenance attached
-    AFTER the fact lands exactly as provenance carried ON the completion would
-    have — same rows, same key, same convergence. A resolve that wrote a
-    different shape than the watch would make the ledger's contents depend on how
-    late the operator was."""
+    Shared by the watch, `resolve_quarantined` and `requeue_quarantined` so
+    that provenance attached AFTER the fact lands exactly as provenance carried
+    ON the completion would have — same rows, same key, same convergence. A
+    resolve that wrote a different shape than the watch would make the ledger's
+    contents depend on how late the operator was."""
     return tuple(
         deliverables.upsert(
             tenant=tenant,
@@ -290,16 +315,18 @@ def _record_deliverables(
     )
 
 
-# What the watch writes into a quarantine row's `resolution_detail` when a
-# re-delivery of the SAME completion arrives carrying provenance the first
-# delivery did not. A constant because it is the operator's explanation for a
-# row that closed itself, and because a test should assert on the state rather
-# than on a phrasing it copied.
-_SELF_RESOLVED_DETAIL = (
-    "a later delivery of this completion carried a readable provenance "
-    "declaration — the deliverable ledger now holds it, so the row closed "
-    "itself (spec §8)"
-)
+def _self_resolved_detail(event_id: str) -> str:
+    """What the watch writes into a quarantine row's `resolution_detail` when a
+    completion of the same ITEM records provenance — crediting the recording
+    event, because the closed row may belong to a DIFFERENT (earlier)
+    completion event and its story must say which delivery settled it. One
+    phrasing, here, so a test asserts on the state rather than on a wording it
+    copied."""
+    return (
+        f"provenance recorded by completion {event_id} — the deliverable "
+        "ledger now holds what this item produced, so the row closed itself "
+        "(spec §8)"
+    )
 
 
 def watch_completion(
@@ -314,7 +341,10 @@ def watch_completion(
 
     Four gates, in this order, each cheaper than the next and each a documented
     pass-through: not a completion, not this tenant's, not minted by this plugin,
-    then — and only then — read the provenance declaration and write.
+    then — and only then — read the provenance declaration and write. A fifth
+    check guards the write itself: a readable declaration whose own quarantine
+    row was already CLOSED is a settled observation, and skips recording
+    (`WatchDisposition.already_settled`).
 
     `tenant` is passed rather than read off the envelope: the watch belongs to
     ONE tenant's pass (the handler holds it), and joining against the envelope's
@@ -399,7 +429,34 @@ def watch_completion(
             detail=detail,
         )
 
-    records = _record_deliverables(
+    # A closed row for THIS event means its observation was already settled:
+    # a resolved row was applied (recording again would race the produced_at
+    # guard for no reason), and a dismissed row is an operator's explicit
+    # "nothing was produced", which a re-delivery must not override with
+    # deliverable rows nobody reviewed. One PK get, marketing completions
+    # only — the only quarantine read the recorded path makes.
+    settled = quarantine.get(tenant, envelope.event_id)
+    if settled is not None and not settled.is_open:
+        log.debug(
+            "completion %r (tenant %r) re-delivered with provenance, but its "
+            "quarantine row is already %s — observation settled, nothing "
+            "recorded",
+            envelope.event_id,
+            tenant,
+            settled.status.value,
+        )
+        return WatchOutcome(
+            envelope,
+            WatchDisposition.already_settled,
+            quarantine=settled,
+            minted_by=origin,
+            detail=(
+                f"quarantine row for completion {envelope.event_id!r} is "
+                f"already {settled.status.value} — nothing recorded"
+            ),
+        )
+
+    writes = _record_deliverables(
         tenant=tenant,
         item_ref=item_ref,
         event_id=envelope.event_id,
@@ -407,20 +464,23 @@ def watch_completion(
         provenance=parsed,
         deliverables=deliverables,
     )
-    # A completion whose EARLIER delivery declared nothing (or something broken)
-    # left an open row; this delivery carries provenance and the deliverables are
-    # already written, so the row has nothing left to ask for. Attempted
-    # unconditionally, because the GUARD is the check: a row that does not exist
-    # (the ordinary case) or that an operator already closed refuses the
-    # transition and is left exactly as it was, so there is nothing to read
-    # first and no window between looking and closing. The deliverables are
-    # written FIRST — the same durable-fact-before-closure discipline
-    # `resolve_quarantined` follows.
-    quarantine.resolve(tenant, envelope.event_id, detail=_SELF_RESOLVED_DETAIL)
+    # An EARLIER provenance-less completion of this item left an open row; this
+    # completion's provenance is recorded, so the row has nothing left to ask
+    # for. Keyed on the ITEM, not the event: the open row may carry a different
+    # event id (completed provenance-less, reopened, completed again), and an
+    # event-keyed close would leave it open forever. One guarded UPDATE, no
+    # read first and no read-back — the guard IS the check (only open rows
+    # match, so a decision an operator already made is untouchable), and the
+    # ordinary case on this hot path is the UPDATE matching nothing. The
+    # deliverables are written FIRST: the rows being closed over are already
+    # durable in the ledger, which is what the crediting detail points at.
+    quarantine.resolve_open_for_item(
+        tenant, item_ref, detail=_self_resolved_detail(envelope.event_id)
+    )
     return WatchOutcome(
         envelope,
         WatchDisposition.recorded,
-        deliverables=records,
+        deliverables=writes,
         minted_by=origin,
     )
 
@@ -430,14 +490,25 @@ class ResolutionOutcome:
     """The result of attaching provenance to a quarantined completion.
 
     `applied` is the quarantine transition's — True exactly when THIS call
-    closed the row. `deliverables` is what was written before it closed, and it
-    is empty on every refusal: a closed row must never be a channel for writing
-    deliverable rows nobody reviewed."""
+    closed the row. `deliverables` is what was written AFTER the close applied
+    (`resolve_quarantined` closes first), as writes, so a declaration the
+    ledger refused as superseded by a newer completion is tellable from one it
+    applied. On a refusal it is empty — a closed row must never be a channel
+    for writing deliverable rows nobody reviewed — with ONE exception: a row
+    already RESOLVED re-applies its OWN stored declaration (the healing path),
+    and `deliverables` reports what that convergence touched."""
 
     record: QuarantineRecord | None
     applied: bool
-    deliverables: tuple[DeliverableRecord, ...] = ()
+    deliverables: tuple[DeliverableWrite, ...] = ()
     detail: str | None = None
+
+    @property
+    def superseded(self) -> tuple[DeliverableRecord, ...]:
+        """The standing rows that refused this resolution's declarations — a
+        stale row resolved after a newer completion recorded converges as
+        exactly these no-ops (`deliverables.DeliverableWrite`)."""
+        return tuple(write.record for write in self.deliverables if not write.applied)
 
 
 def resolve_quarantined(
@@ -451,24 +522,68 @@ def resolve_quarantined(
 ) -> ResolutionOutcome:
     """Spec §8's "resolvable by attaching provenance after the fact".
 
-    The operator verb, composed of two durable steps in a deliberate order:
-    the deliverable rows are upserted FIRST and the quarantine row is closed
-    SECOND. A crash in between leaves an open row beside a recorded deliverable —
-    re-running converges (the upsert lands on the same rows, the close applies
-    once) — whereas closing first would lose the deliverable behind a row that
-    says it was recorded. Same discipline as minting's claim-before-call.
+    The operator verb, composed of two durable steps in a deliberate order: the
+    quarantine row is closed FIRST — a guarded open->resolved compare-and-set
+    that persists the attached declaration verbatim on the row
+    (`attached_provenance`) — and the deliverable rows are upserted SECOND,
+    only when the close APPLIED. That makes the empty-on-refusal contract true
+    under the race: two operators resolving one row settle in the store, and
+    the loser's declaration provably never touches the ledger (under the
+    reverse, write-first order it already had).
 
-    Refuses without writing anything when the row does not exist or is already
-    closed. `provenance` is a PARSED declaration, so an operator's attachment
-    goes through exactly the validation a producer's would
+    The remaining crash window is between the close and the upserts: a
+    RESOLVED row whose deliverables are not yet written. That direction is
+    chosen deliberately — the declaration is durable on the row, so nothing is
+    lost, and re-invoking this verb on the row re-applies the STORED
+    declaration idempotently (the healing path below; §11's surface, or an
+    operator retrying, converges it). The reverse order's window was worse:
+    durable ledger rows nobody reviewed, standing beside a row an operator
+    might then dismiss.
+
+    Refuses without writing anything when the row does not exist or was
+    DISMISSED. On a row already RESOLVED, the healing path runs instead: the
+    row's OWN stored declaration — never the caller's, because a closed row
+    must not become a channel for new unreviewed rows — is re-applied through
+    the same guarded upserts, converging to a no-op if they already landed.
+    `applied` stays False either way: this call closed nothing.
+
+    `provenance` is a PARSED declaration, so an operator's attachment goes
+    through exactly the validation a producer's would
     (`provenance.parse_provenance`); this function cannot be handed a shape the
     watch would have quarantined.
 
     The row's OWN facts supply everything but the declaration: the item ref it
     was filed against and the completion's `occurred_at` as `produced_at`, so a
     deliverable recorded late is stamped with when the work actually completed
-    rather than when someone got round to filing it."""
-    row = quarantine.get(tenant, event_id)
+    rather than when someone got round to filing it — and the ledger's
+    newest-completion-wins guard therefore refuses the attachment (reported
+    via `superseded`) if a newer completion recorded while the row sat open."""
+    detail = "provenance attached after the fact: " + ", ".join(
+        f"{declared.channel}/{declared.deliverable_class}"
+        for declared in provenance.deliverables
+    )
+    if note:
+        detail = f"{detail} — {note}"
+    transition: QuarantineTransition = quarantine.resolve(
+        tenant,
+        event_id,
+        detail=detail,
+        attached_provenance=provenance.model_dump_json(),
+    )
+    row = transition.record
+    if transition.applied:
+        assert row is not None  # the CAS applied, so the row exists
+        written = _record_deliverables(
+            tenant=tenant,
+            item_ref=row.item_ref,
+            event_id=row.event_id,
+            produced_at=row.occurred_at,
+            provenance=provenance,
+            deliverables=deliverables,
+        )
+        return ResolutionOutcome(
+            record=row, applied=True, deliverables=written, detail=detail
+        )
     if row is None:
         return ResolutionOutcome(
             record=None,
@@ -478,36 +593,39 @@ def resolve_quarantined(
                 "nothing written"
             ),
         )
-    if not row.is_open:
+    if row.status is QuarantineStatus.resolved and row.attached_provenance:
+        # The healing path: an earlier resolve closed the row and crashed (or
+        # was refused mid-write) before its deliverables landed. The stored
+        # declaration is what that resolve was closing over, so re-applying it
+        # converges — the upserts land on the same rows, or report superseded
+        # if a newer completion has recorded since.
+        healed = _record_deliverables(
+            tenant=tenant,
+            item_ref=row.item_ref,
+            event_id=row.event_id,
+            produced_at=row.occurred_at,
+            provenance=DeliverableProvenance.model_validate_json(
+                row.attached_provenance
+            ),
+            deliverables=deliverables,
+        )
         return ResolutionOutcome(
             record=row,
             applied=False,
+            deliverables=healed,
             detail=(
-                f"quarantined completion {event_id!r} is already "
-                f"{row.status.value} — nothing written"
+                f"quarantined completion {event_id!r} is already resolved — "
+                "re-applied the declaration stored on the row; nothing new "
+                "was attached"
             ),
         )
-    written = _record_deliverables(
-        tenant=tenant,
-        item_ref=row.item_ref,
-        event_id=row.event_id,
-        produced_at=row.occurred_at,
-        provenance=provenance,
-        deliverables=deliverables,
-    )
-    detail = "provenance attached after the fact: " + ", ".join(
-        f"{record.channel}/{record.deliverable_class}" for record in written
-    )
-    if note:
-        detail = f"{detail} — {note}"
-    transition: QuarantineTransition = quarantine.resolve(
-        tenant, event_id, detail=detail
-    )
     return ResolutionOutcome(
-        record=transition.record,
-        applied=transition.applied,
-        deliverables=written,
-        detail=detail,
+        record=row,
+        applied=False,
+        detail=(
+            f"quarantined completion {event_id!r} is already "
+            f"{row.status.value} — nothing written"
+        ),
     )
 
 
@@ -524,10 +642,129 @@ def dismiss_quarantined(
     Deliberately a THIN pass-through to the store — there is nothing to compose,
     which is exactly the difference from `resolve_quarantined` and the reason the
     two are separate verbs rather than one `close(status)`. It lives here anyway
-    so both operator verbs are found in one place, and so a caller reaching for
-    "how do I close this row?" cannot find one of them and miss that the other
-    writes rows."""
+    so the operator verbs are found in one place, and so a caller reaching for
+    "how do I close this row?" cannot find one of them and miss that the others
+    write rows."""
     return quarantine.dismiss(tenant, event_id, detail=detail)
+
+
+@dataclass(frozen=True)
+class RequeueOutcome:
+    """The result of re-running the watch's classification over a quarantined
+    completion's stored event (spec §4's requeue verb).
+
+    `applied` is True exactly when the row was OPEN and this call's
+    re-classification LANDED — whether that was a close (the declaration
+    parsed; `deliverables` holds the writes and `record` the resolved row) or
+    a refresh (still unreadable; `record` stays open with the new reason).
+    False means the row does not exist (`record` is None), was already
+    closed, or a racing closer settled it mid-verb — either way this call
+    decided nothing."""
+
+    record: QuarantineRecord | None
+    applied: bool
+    deliverables: tuple[DeliverableWrite, ...] = ()
+    detail: str | None = None
+
+
+def requeue_quarantined(
+    tenant: str,
+    event_id: str,
+    *,
+    deliverables: DeliverableStore,
+    quarantine: QuarantineStore,
+) -> RequeueOutcome:
+    """Spec §4's requeue verb, spelled for completions: re-run the full watch
+    classification over the OPEN row's stored completion event.
+
+    For the case where the COMPLETION was always right and the READER was not —
+    a provenance parser bug fixed, a schema version this deploy now speaks. The
+    row keeps the event whole (`models.CompletionQuarantineEntry`), so nothing
+    needs re-delivering: the stored event goes back through the same
+    `parse_provenance` the watch runs, and
+
+    - a declaration that now PARSES is recorded through the same guarded
+      upserts the watch uses (newest-completion-wins, so a newer completion's
+      facts are not rolled back) and the row closes as resolved, detail
+      "requeued" — the same terminal state an operator attachment reaches,
+      because the ledger's contents must not depend on which verb recorded
+      them;
+    - a declaration still missing or malformed leaves the row OPEN with its
+      reason, detail and `updated_at` refreshed (`refresh_open`), so the queue
+      says what is wrong NOW rather than what was wrong at filing.
+
+    Guarded like the closing verbs: only open rows. A closed row is a settled
+    observation and refuses (`applied=False`); a row that does not exist
+    reports None. The recording is deliverables-first (unlike
+    `resolve_quarantined`, which must persist an OPERATOR's declaration before
+    closing): the declaration here IS the stored event, already durable on the
+    open row, so a crash between the record and the close re-runs this verb
+    and converges."""
+    row = quarantine.get(tenant, event_id)
+    if row is None:
+        return RequeueOutcome(
+            record=None,
+            applied=False,
+            detail=(
+                f"no quarantined completion {event_id!r} for tenant {tenant!r} — "
+                "nothing to requeue"
+            ),
+        )
+    if not row.is_open:
+        return RequeueOutcome(
+            record=row,
+            applied=False,
+            detail=(
+                f"quarantined completion {event_id!r} is already "
+                f"{row.status.value} — a closed row is settled, not requeueable"
+            ),
+        )
+    # The stored event is the envelope the watch itself was handed, kept whole
+    # (`watch_completion` files `model_dump_json`), so it re-validates.
+    envelope = EventEnvelope.model_validate_json(row.raw_event)
+    parsed = parse_provenance(envelope)
+    if isinstance(parsed, MissingProvenance):
+        reason = (
+            QuarantineReason.provenance_missing
+            if parsed.is_absent
+            else QuarantineReason.provenance_malformed
+        )
+        refreshed = quarantine.refresh_open(
+            tenant,
+            event_id,
+            reason=reason,
+            detail=(
+                f"{parsed.detail} — requeue re-ran the classification and the "
+                "declaration is still unreadable"
+            ),
+        )
+        return RequeueOutcome(
+            record=refreshed.record,
+            applied=refreshed.applied,
+            detail=refreshed.record.detail if refreshed.record else None,
+        )
+    written = _record_deliverables(
+        tenant=tenant,
+        item_ref=row.item_ref,
+        event_id=row.event_id,
+        produced_at=row.occurred_at,
+        provenance=parsed,
+        deliverables=deliverables,
+    )
+    detail = "requeued: the stored declaration now parses — " + ", ".join(
+        f"{declared.channel}/{declared.deliverable_class}"
+        for declared in parsed.deliverables
+    )
+    transition = quarantine.resolve(tenant, event_id, detail=detail)
+    return RequeueOutcome(
+        record=transition.record,
+        # The guarded close's answer, not the earlier read's: a closer racing
+        # this verb settles in the store, and the loser must not report a
+        # decision it did not make (the writes above converge either way).
+        applied=transition.applied,
+        deliverables=written,
+        detail=detail,
+    )
 
 
 class ProvenanceWatchHandler(MintingEvaluationHandler):

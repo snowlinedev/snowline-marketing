@@ -22,6 +22,15 @@ words, and this is that sentence in SQL. The convergence is what makes the watch
 safe under at-least-once delivery: the same completion applied twice leaves one
 row, identical both times.
 
+**The NEWEST completion wins, by `produced_at`.** "Latest declaration" means
+latest by when the producing work COMPLETED, not by delivery order — an outbox
+that re-delivers an old completion after a newer one recorded must converge as
+a no-op, not roll the row's facts back. So the conflict update is guarded
+(`WHERE existing.produced_at <= excluded.produced_at`; equal re-applies, which
+is what re-delivery of the SAME completion is) and a refused write is reported
+per deliverable (`DeliverableWrite.applied`), so the watch and the quarantine
+resolve verb can say "superseded" instead of silently pretending they wrote.
+
 **The version set is REPLACED, not merged.** A deliverable's source versions are
 a SET-valued attribute of the row, so the write deletes the association rows and
 re-inserts the declared ones inside the SAME transaction. Merging would be worse
@@ -50,24 +59,18 @@ contract tests run over both as one parametrized suite.
 from __future__ import annotations
 
 import dataclasses
-from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import delete, func, insert, select
+from sqlalchemy import delete, func, insert, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from snowline_marketing.db import session_scope
+from snowline_marketing import classify
+from snowline_marketing.db import session_scope, utc_now
 from snowline_marketing.models import DeliverableProvenanceEntry as DeliverableRow
 from snowline_marketing.models import DeliverableSourceVersion as SourceVersionRow
-
-
-def _utc_now() -> datetime:
-    """`InMemoryDeliverables`' default clock — the in-process stand-in for the
-    timestamptz `func.now()` the real store's columns default to."""
-    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,23 @@ class DeliverableRecord:
         return (self.tenant, self.item_ref, self.channel, self.deliverable_class)
 
 
+@dataclass(frozen=True)
+class DeliverableWrite:
+    """The result of one `upsert` call: the row that now holds the key, and
+    whether THIS call's declaration is the one standing on it.
+
+    `applied` is the newest-completion-wins guard's answer (module docstring):
+    False exactly when the standing row was produced by a LATER completion
+    than this declaration's `produced_at`, so the write was refused and the
+    ledger kept the newer facts — the convergence a stale outbox re-delivery
+    must land as. `record` is the row as it stands AFTER the attempt: the
+    written row when the write applied, and the newer row that REFUSED it
+    otherwise, so a caller reporting "superseded" can say by what."""
+
+    record: DeliverableRecord
+    applied: bool
+
+
 def _validated_versions(
     source_versions: Iterable[SourceVersion],
 ) -> tuple[SourceVersion, ...]:
@@ -146,8 +166,7 @@ def _validated_versions(
             "that names none is a row the staleness sweep can never evaluate "
             "(spec §8)"
         )
-    counts = Counter(version.artifact_id for version in versions)
-    duplicated = sorted(name for name, count in counts.items() if count > 1)
+    duplicated = classify.duplicates(version.artifact_id for version in versions)
     if duplicated:
         raise ValueError(
             "a deliverable may cite each source artifact at exactly one version; "
@@ -176,7 +195,7 @@ class DeliverableStore(Protocol):
         produced_at: datetime,
         event_id: str,
         external_url: str | None = None,
-    ) -> DeliverableRecord: ...
+    ) -> DeliverableWrite: ...
 
     def get(
         self, tenant: str, item_ref: str, channel: str, deliverable_class: str
@@ -200,18 +219,26 @@ class DeliverableProvenanceLedger:
         produced_at: datetime,
         event_id: str,
         external_url: str | None = None,
-    ) -> DeliverableRecord:
+    ) -> DeliverableWrite:
         """Record what one completed item produced on one channel, converging on
         re-declaration (see the module docstring for why this upserts where the
         delivery ledger refuses to).
 
-        One transaction: the row is upserted, its association rows are replaced,
-        and the whole thing is read back — so the record handed to a caller is
-        the row as it stands, never the arguments echoed back. `created_at` keeps
-        its INSERT default on the conflict path (a re-declaration is convergence,
-        not a fresh deliverable) while `updated_at` moves, which is what makes
-        "we heard about this again" a fact the row states rather than one a
-        reader infers.
+        One transaction: the row is upserted, its association rows are replaced
+        exactly when the row write applied, and the whole thing is read back —
+        so the record handed to a caller is the row as it stands, never the
+        arguments echoed back. `created_at` keeps its INSERT default on the
+        conflict path (a re-declaration is convergence, not a fresh deliverable)
+        while `updated_at` moves, which is what makes "we heard about this
+        again" a fact the row states rather than one a reader infers.
+
+        The conflict update carries the newest-completion-wins guard (module
+        docstring): a declaration older than the standing row's `produced_at`
+        is refused whole — row AND version set, which is why the replacement is
+        conditional on `applied` — and comes back as the standing row with
+        `applied=False`. `RETURNING` decides who applied, for `ledger.record`'s
+        reason: it yields a row exactly when the insert or the guarded update
+        happened, where `rowcount` cannot be trusted under ON CONFLICT.
 
         Raises ValueError — before the database is touched — for an empty or
         artifact-duplicated version set (`_validated_versions`). Raises like any
@@ -245,42 +272,48 @@ class DeliverableProvenanceLedger:
                 # makes a re-delivery visible as convergence.
                 "updated_at": func.now(),
             },
-        )
+            # Newest completion wins; equal re-applies (a re-delivery of the
+            # SAME completion must still converge the row onto its facts).
+            where=DeliverableRow.produced_at <= statement.excluded.produced_at,
+        ).returning(DeliverableRow.item_ref)
         with session_scope() as session:
-            session.execute(upsert)
-            # Replace, never merge (module docstring): a corrected declaration
-            # must not leave the version it corrected behind for §8's sweep to
-            # compare against.
-            session.execute(
-                delete(SourceVersionRow).where(
-                    SourceVersionRow.tenant == tenant,
-                    SourceVersionRow.item_ref == item_ref,
-                    SourceVersionRow.channel == channel,
-                    SourceVersionRow.deliverable_class == deliverable_class,
+            applied = session.execute(upsert).first() is not None
+            if applied:
+                # Replace, never merge (module docstring): a corrected
+                # declaration must not leave the version it corrected behind
+                # for §8's sweep to compare against. Only when the row write
+                # applied — a superseded declaration's versions must not be
+                # stitched under the newer row's facts.
+                session.execute(
+                    delete(SourceVersionRow).where(
+                        SourceVersionRow.tenant == tenant,
+                        SourceVersionRow.item_ref == item_ref,
+                        SourceVersionRow.channel == channel,
+                        SourceVersionRow.deliverable_class == deliverable_class,
+                    )
                 )
-            )
-            session.execute(
-                insert(SourceVersionRow),
-                [
-                    {
-                        "tenant": tenant,
-                        "item_ref": item_ref,
-                        "channel": channel,
-                        "deliverable_class": deliverable_class,
-                        "artifact_id": version.artifact_id,
-                        "version_id": version.version_id,
-                        "milestone": version.milestone,
-                    }
-                    for version in versions
-                ],
-            )
+                session.execute(
+                    insert(SourceVersionRow),
+                    [
+                        {
+                            "tenant": tenant,
+                            "item_ref": item_ref,
+                            "channel": channel,
+                            "deliverable_class": deliverable_class,
+                            "artifact_id": version.artifact_id,
+                            "version_id": version.version_id,
+                            "milestone": version.milestone,
+                        }
+                        for version in versions
+                    ],
+                )
             record = self._read(session, key)
             if record is None:  # pragma: no cover - the upsert just wrote it
                 raise AssertionError(
                     f"deliverable {key!r} vanished between its upsert and its "
                     "read-back in one transaction"
                 )
-            return record
+            return DeliverableWrite(record=record, applied=applied)
 
     def get(
         self, tenant: str, item_ref: str, channel: str, deliverable_class: str
@@ -322,8 +355,7 @@ class DeliverableProvenanceLedger:
         if limit is not None:
             statement = statement.limit(max(0, limit))
         with session_scope() as session:
-            rows = list(session.scalars(statement))
-            return [self._with_versions(session, row) for row in rows]
+            return self._records(session, list(session.scalars(statement)))
 
     def _read_many(self, *criteria) -> list[DeliverableRecord]:
         statement = (
@@ -336,48 +368,75 @@ class DeliverableProvenanceLedger:
             )
         )
         with session_scope() as session:
-            rows = list(session.scalars(statement))
-            return [self._with_versions(session, row) for row in rows]
+            return self._records(session, list(session.scalars(statement)))
 
     def _read(
         self, session, key: tuple[str, str, str, str]
     ) -> DeliverableRecord | None:
         row = session.get(DeliverableRow, key)
-        return None if row is None else self._with_versions(session, row)
+        if row is None:
+            return None
+        (record,) = self._records(session, [row])
+        return record
 
-    def _with_versions(self, session, row: DeliverableRow) -> DeliverableRecord:
-        """One row plus its association rows, ordered by artifact id — the same
-        order `_validated_versions` stores them in, so a read-back compares equal
-        to what the in-memory store holds."""
-        versions = session.scalars(
+    def _records(self, session, rows: list[DeliverableRow]) -> list[DeliverableRecord]:
+        """The rows plus their association rows — fetched in ONE query (the
+        natural keys, `IN`-listed) and stitched in memory, so a listing costs
+        two statements however many rows it returns rather than one per row.
+
+        Result order is the caller's row order; each row's versions are ordered
+        by artifact id — the same order `_validated_versions` stores them in,
+        so a read-back compares equal to what the in-memory store holds."""
+        if not rows:
+            return []
+        keys = [
+            (row.tenant, row.item_ref, row.channel, row.deliverable_class)
+            for row in rows
+        ]
+        versions: dict[tuple[str, str, str, str], list[SourceVersion]] = {}
+        fetched = session.scalars(
             select(SourceVersionRow)
             .where(
-                SourceVersionRow.tenant == row.tenant,
-                SourceVersionRow.item_ref == row.item_ref,
-                SourceVersionRow.channel == row.channel,
-                SourceVersionRow.deliverable_class == row.deliverable_class,
+                tuple_(
+                    SourceVersionRow.tenant,
+                    SourceVersionRow.item_ref,
+                    SourceVersionRow.channel,
+                    SourceVersionRow.deliverable_class,
+                ).in_(keys)
             )
             .order_by(SourceVersionRow.artifact_id)
         )
-        return DeliverableRecord(
-            tenant=row.tenant,
-            item_ref=row.item_ref,
-            channel=row.channel,
-            deliverable_class=row.deliverable_class,
-            source_versions=tuple(
+        for version in fetched:
+            versions.setdefault(
+                (
+                    version.tenant,
+                    version.item_ref,
+                    version.channel,
+                    version.deliverable_class,
+                ),
+                [],
+            ).append(
                 SourceVersion(
                     artifact_id=version.artifact_id,
                     version_id=version.version_id,
                     milestone=version.milestone,
                 )
-                for version in versions
-            ),
-            produced_at=row.produced_at,
-            event_id=row.event_id,
-            created_at=row.created_at,
-            external_url=row.external_url,
-            updated_at=row.updated_at,
-        )
+            )
+        return [
+            DeliverableRecord(
+                tenant=row.tenant,
+                item_ref=row.item_ref,
+                channel=row.channel,
+                deliverable_class=row.deliverable_class,
+                source_versions=tuple(versions.get(key, ())),
+                produced_at=row.produced_at,
+                event_id=row.event_id,
+                created_at=row.created_at,
+                external_url=row.external_url,
+                updated_at=row.updated_at,
+            )
+            for row, key in zip(rows, keys)
+        ]
 
 
 class InMemoryDeliverables:
@@ -387,9 +446,10 @@ class InMemoryDeliverables:
     store the fixtures-first flow (spec §5) and §11's dry-run drive, so the
     convergence the suite proves here is the convergence production has. It
     shares `_validated_versions` with the real store, keys on the same natural
-    tuple, replaces the version set the same way, and keeps `created_at` frozen
-    while `updated_at` moves — the four things a re-delivered completion's
-    behaviour depends on.
+    tuple, replaces the version set the same way, keeps `created_at` frozen
+    while `updated_at` moves, and refuses a declaration older than the standing
+    row's `produced_at` on the same `<=` guard — the things a re-delivered
+    completion's behaviour depends on.
 
     The LISTING surface stays partly DB-only (`list_for_tenant`): that exists for
     §11's dashboard, which reads Postgres. `list_for_item` is here because it is
@@ -404,7 +464,7 @@ class InMemoryDeliverables:
 
     def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
         self._rows: dict[tuple[str, str, str, str], DeliverableRecord] = {}
-        self._clock = clock if clock is not None else _utc_now
+        self._clock = clock if clock is not None else utc_now
 
     def upsert(
         self,
@@ -417,13 +477,18 @@ class InMemoryDeliverables:
         produced_at: datetime,
         event_id: str,
         external_url: str | None = None,
-    ) -> DeliverableRecord:
+    ) -> DeliverableWrite:
         """See `DeliverableStore.upsert` / `DeliverableProvenanceLedger.upsert`.
         Raises the same ValueError, on the same terms, before anything is
-        stored."""
+        stored; refuses an out-of-date declaration on the same guard."""
         versions = _validated_versions(source_versions)
         key = (tenant, item_ref, channel, deliverable_class)
         existing = self._rows.get(key)
+        if existing is not None and produced_at < existing.produced_at:
+            # The newest-completion-wins guard, same `<=` as the real store's
+            # conflict WHERE: the standing row was produced by a later
+            # completion, so this declaration is superseded and nothing moves.
+            return DeliverableWrite(record=existing, applied=False)
         if existing is None:
             record = DeliverableRecord(
                 tenant=tenant,
@@ -449,7 +514,7 @@ class InMemoryDeliverables:
                 updated_at=self._clock(),
             )
         self._rows[key] = record
-        return record
+        return DeliverableWrite(record=record, applied=True)
 
     def get(
         self, tenant: str, item_ref: str, channel: str, deliverable_class: str

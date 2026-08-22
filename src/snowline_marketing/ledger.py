@@ -91,13 +91,13 @@ import dataclasses
 import enum
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from snowline_marketing.db import session_scope
+from snowline_marketing.db import session_scope, utc_now
 from snowline_marketing.models import DELIVERY_OUTCOME_VALUES
 from snowline_marketing.models import DeliveryLedgerEntry as DeliveryLedgerRow
 
@@ -222,12 +222,6 @@ RECONCILIATION_OUTCOMES = frozenset({DeliveryOutcome.claimed, DeliveryOutcome.fa
 # by callers, so an event-level shape cannot be forged from a policy template.
 _POLICY_KEY_NAMESPACE = "p:"
 _EVENT_KEY_NAMESPACE = "e:"
-
-
-def _utc_now() -> datetime:
-    """`InMemoryDeliveryLedger`'s default clock — the in-process stand-in for
-    the timestamptz `func.now()` the real store's columns default to."""
-    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -917,7 +911,7 @@ class InMemoryDeliveryLedger(_LedgerTransitions):
 
     def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
         self._rows: dict[tuple[str, str], LedgerRecord] = {}
-        self._clock = clock if clock is not None else _utc_now
+        self._clock = clock if clock is not None else utc_now
 
     def record(
         self,

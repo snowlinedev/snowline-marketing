@@ -78,7 +78,6 @@ Constraints this module encodes, and why:
 from __future__ import annotations
 
 import enum
-from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Literal
@@ -160,10 +159,9 @@ class DeclaredDeliverable(_Model):
 
     @model_validator(mode="after")
     def _one_version_per_artifact(self) -> DeclaredDeliverable:
-        counts = Counter(
+        duplicated = classify.duplicates(
             version.artifact_id for version in self.source_artifact_versions
         )
-        duplicated = sorted(name for name, count in counts.items() if count > 1)
         if duplicated:
             raise ValueError(
                 "a deliverable may cite each source artifact at exactly one "
@@ -186,8 +184,9 @@ class DeliverableProvenance(_Model):
 
     @model_validator(mode="after")
     def _deliverable_identities_are_distinct(self) -> DeliverableProvenance:
-        counts = Counter(deliverable.identity for deliverable in self.deliverables)
-        duplicated = sorted(name for name, count in counts.items() if count > 1)
+        duplicated = classify.duplicates(
+            deliverable.identity for deliverable in self.deliverables
+        )
         if duplicated:
             pairs = ", ".join(f"{channel}/{klass}" for channel, klass in duplicated)
             raise ValueError(

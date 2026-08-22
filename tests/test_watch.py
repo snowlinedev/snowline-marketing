@@ -74,6 +74,7 @@ from snowline_marketing.sources import FixturesEventSource
 from snowline_marketing.watch import (
     WatchDisposition,
     dismiss_quarantined,
+    requeue_quarantined,
     resolve_quarantined,
     run_intake_and_watch,
     watch_completion,
@@ -529,12 +530,481 @@ def test_a_later_delivery_carrying_provenance_closes_the_row_it_left(watch_store
     row = watch_stores.quarantine.get(TENANT, "pm-evt-0000502")
     assert row.status is QuarantineStatus.resolved
     assert "closed itself" in row.resolution_detail
+    # The detail credits the RECORDING event — here the same completion
+    # re-delivered, but the close is item-keyed and the credit says which
+    # delivery settled the row.
+    assert "pm-evt-0000502" in row.resolution_detail
     assert (
         len(
             watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
         )
         == 2
     )
+
+
+def test_a_later_completion_of_the_same_item_closes_an_earlier_events_row(
+    watch_stores,
+):
+    # The self-close is keyed on the ITEM, not the event: an item completed
+    # provenance-less (event E1), reopened, and completed again WITH provenance
+    # (a NEW event E2) must settle E1's open row — an event-keyed close would
+    # leave it open forever. The detail credits E2, the delivery that recorded.
+    seed_the_capture(watch_stores)
+    kwargs = dict(
+        tenant=TENANT,
+        ledger=watch_stores.ledger,
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    first = watch_completion(fixture_envelope(WITHOUT_PROVENANCE), **kwargs)
+    assert first.disposition is WatchDisposition.quarantined_missing
+
+    recompleted = parse_envelope(
+        make_envelope(
+            EventType.item_completed,
+            event_id="pm-evt-0000910",
+            occurred_at="2026-07-29T09:00:00+00:00",
+            subject={"kind": "work_item", "id": MINTED_ITEM_REFS["missing"]},
+            payload={
+                "scope": SCOPE,
+                "details": {
+                    PROVENANCE_DETAILS_KEY: declaration().model_dump(mode="json")
+                },
+            },
+        )
+    )
+    second = watch_completion(recompleted, **kwargs)
+    assert second.disposition is WatchDisposition.recorded
+    assert second.superseded == ()
+    row = watch_stores.quarantine.get(TENANT, "pm-evt-0000502")
+    assert row.status is QuarantineStatus.resolved
+    assert "pm-evt-0000910" in row.resolution_detail
+    assert (
+        len(
+            watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
+        )
+        == 2
+    )
+
+
+class CountsQuarantineCalls:
+    """A pass-through proxy that records which store verbs the watch invoked —
+    the in-memory stand-in for counting SQL statements, proving the recorded
+    path's quarantine cost stays at one PK get plus one guarded UPDATE."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.calls: list[str] = []
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if not callable(attr):  # pragma: no cover - stores expose only verbs
+            return attr
+
+        def counted(*args, **kwargs):
+            self.calls.append(name)
+            return attr(*args, **kwargs)
+
+        return counted
+
+
+def test_the_recorded_path_costs_one_get_and_one_guarded_update():
+    # The hot path: a recorded completion with nothing quarantined must touch
+    # the quarantine store exactly twice — the PK get that checks for a settled
+    # row, and the item-keyed close that matches nothing. No read-backs, no
+    # listing, nothing else.
+    stores = Stores(
+        InMemoryDeliveryLedger(), InMemoryDeliverables(), InMemoryCompletionQuarantine()
+    )
+    seed_the_capture(stores)
+    counting = CountsQuarantineCalls(stores.quarantine)
+    outcome = watch_completion(
+        fixture_envelope(WITH_PROVENANCE),
+        tenant=TENANT,
+        ledger=stores.ledger,
+        deliverables=stores.deliverables,
+        quarantine=counting,
+    )
+    assert outcome.disposition is WatchDisposition.recorded
+    assert counting.calls == ["get", "resolve_open_for_item"]
+
+
+# --- newest completion wins (the deliverable ledger's produced_at guard) ------
+
+
+def completion_with(
+    event_id: str,
+    *,
+    item_ref: str,
+    occurred_at: str,
+    declared: dict,
+) -> EventEnvelope:
+    """One provenance-carrying completion of `item_ref`, hand-built the way the
+    stale/newer tests need to control every identity and timestamp."""
+    return parse_envelope(
+        make_envelope(
+            EventType.item_completed,
+            event_id=event_id,
+            occurred_at=occurred_at,
+            subject={"kind": "work_item", "id": item_ref},
+            payload={
+                "scope": SCOPE,
+                "details": {PROVENANCE_DETAILS_KEY: declared},
+            },
+        )
+    )
+
+
+def test_a_stale_re_delivery_after_a_newer_completion_converges_as_superseded(
+    watch_stores,
+):
+    # An outbox re-delivers an OLD completion after a newer one recorded (the
+    # item was reopened, corrected and completed again; the old event replays
+    # later). The re-delivery must converge as superseded no-ops — recording
+    # it would roll the ledger's facts back to a declaration the producer
+    # already corrected.
+    seed_the_capture(watch_stores)
+    kwargs = dict(
+        tenant=TENANT,
+        ledger=watch_stores.ledger,
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    corrected = declaration().model_dump(mode="json")
+    corrected["deliverables"][0]["source_artifact_versions"][0]["version_id"] = (
+        "av-corrected1"
+    )
+    newer = watch_completion(
+        completion_with(
+            "pm-evt-0000920",
+            item_ref=MINTED_ITEM_REFS["provenance"],
+            occurred_at="2026-07-30T10:00:00+00:00",
+            declared=corrected,
+        ),
+        **kwargs,
+    )
+    assert newer.disposition is WatchDisposition.recorded
+    assert newer.superseded == ()
+
+    replayed = watch_completion(fixture_envelope(WITH_PROVENANCE), **kwargs)
+    assert replayed.disposition is WatchDisposition.recorded
+    # Every declared deliverable was refused — and the refusing rows say by
+    # what: the newer completion's facts, still standing.
+    assert {row.deliverable_class for row in replayed.superseded} == {
+        "screenshot_set",
+        "store_listing",
+    }
+    rows = watch_stores.deliverables.list_for_item(
+        TENANT, MINTED_ITEM_REFS["provenance"]
+    )
+    assert all(row.event_id == "pm-evt-0000920" for row in rows)
+    listing = next(row for row in rows if row.deliverable_class == "store_listing")
+    assert "av-corrected1" in [v.version_id for v in listing.source_versions]
+
+
+def test_resolving_a_stale_row_after_a_newer_recording_reports_superseded(
+    watch_stores,
+):
+    # A provenance-less OLD completion delivers late, after a newer completion
+    # of the same item already recorded: the row still deserves closing, but
+    # the attachment lands as superseded and the ledger keeps the newer facts.
+    seed_the_capture(watch_stores)
+    kwargs = dict(
+        tenant=TENANT,
+        ledger=watch_stores.ledger,
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    newer = watch_completion(
+        completion_with(
+            "pm-evt-0000930",
+            item_ref=MINTED_ITEM_REFS["missing"],
+            occurred_at="2026-07-30T10:00:00+00:00",
+            declared=declaration().model_dump(mode="json"),
+        ),
+        **kwargs,
+    )
+    assert newer.disposition is WatchDisposition.recorded
+    stale = watch_completion(fixture_envelope(WITHOUT_PROVENANCE), **kwargs)
+    assert stale.disposition is WatchDisposition.quarantined_missing
+
+    resolution = resolve_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        provenance=declaration(),
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    # The row closes — the observation IS settled — while the ledger stays
+    # exactly as the newer completion left it.
+    assert resolution.applied
+    assert resolution.record.status is QuarantineStatus.resolved
+    assert {row.deliverable_class for row in resolution.superseded} == {
+        "screenshot_set",
+        "store_listing",
+    }
+    rows = watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
+    assert all(row.event_id == "pm-evt-0000930" for row in rows)
+
+
+# --- a closed row settles its event -------------------------------------------
+
+
+def test_a_dismissed_row_is_not_overridden_by_a_provenance_carrying_redelivery(
+    watch_stores,
+):
+    # A dismissal is the operator's explicit "nothing was produced". A later
+    # re-delivery of the SAME completion carrying provenance must not write
+    # deliverable rows over that judgment.
+    seed_the_capture(watch_stores)
+    drive(watch_stores)
+    dismiss_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        quarantine=watch_stores.quarantine,
+        detail="completed as no longer needed — nothing was produced",
+    )
+    fixed = completion_with(
+        "pm-evt-0000502",
+        item_ref=MINTED_ITEM_REFS["missing"],
+        occurred_at="2026-07-28T11:02:30+00:00",
+        declared=declaration().model_dump(mode="json"),
+    )
+    outcome = watch_completion(
+        fixed,
+        tenant=TENANT,
+        ledger=watch_stores.ledger,
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert outcome.disposition is WatchDisposition.already_settled
+    assert outcome.deliverables == ()
+    assert (
+        watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
+        == []
+    )
+    assert watch_stores.quarantine.get(TENANT, "pm-evt-0000502").status is (
+        QuarantineStatus.dismissed
+    )
+
+
+def test_a_resolved_row_redelivered_with_provenance_does_not_double_write(
+    watch_stores,
+):
+    # A resolved row was already applied: the re-delivery converges as a quiet
+    # no-op, leaving both the row and the ledger exactly as the resolve left
+    # them (and the produced_at guard backstops even this skip).
+    seed_the_capture(watch_stores)
+    drive(watch_stores)
+    resolve_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        provenance=declaration(),
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    before = watch_stores.deliverables.list_for_item(
+        TENANT, MINTED_ITEM_REFS["missing"]
+    )
+    assert len(before) == 2
+    fixed = completion_with(
+        "pm-evt-0000502",
+        item_ref=MINTED_ITEM_REFS["missing"],
+        occurred_at="2026-07-28T11:02:30+00:00",
+        declared=declaration().model_dump(mode="json"),
+    )
+    outcome = watch_completion(
+        fixed,
+        tenant=TENANT,
+        ledger=watch_stores.ledger,
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert outcome.disposition is WatchDisposition.already_settled
+    assert (
+        watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
+        == before
+    )
+    assert watch_stores.quarantine.get(TENANT, "pm-evt-0000502").status is (
+        QuarantineStatus.resolved
+    )
+
+
+# --- close-first resolve: the healing path ------------------------------------
+
+
+class CrashesBeforeWriting:
+    """The resolve verb's crash window, made deterministic: the row closes (the
+    declaration durable on it) and the process dies before the deliverable
+    upserts. A proxy, like `CrashesAfterFiling`, so the state left behind is
+    exactly what a real crash leaves."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def upsert(self, **kwargs):
+        raise RuntimeError("process died after the close, before the writes")
+
+
+def test_a_crash_between_close_and_writes_heals_from_the_stored_declaration(
+    watch_stores,
+):
+    seed_the_capture(watch_stores)
+    drive(watch_stores)
+    with pytest.raises(RuntimeError, match="before the writes"):
+        resolve_quarantined(
+            TENANT,
+            "pm-evt-0000502",
+            provenance=declaration(),
+            deliverables=CrashesBeforeWriting(watch_stores.deliverables),
+            quarantine=watch_stores.quarantine,
+        )
+    # The window: a resolved row, its declaration durable on it, no ledger rows
+    # yet. Nothing is lost — the row itself says what to apply.
+    row = watch_stores.quarantine.get(TENANT, "pm-evt-0000502")
+    assert row.status is QuarantineStatus.resolved
+    assert row.attached_provenance is not None
+    assert (
+        watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
+        == []
+    )
+
+    healed = resolve_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        provenance=declaration(),
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    # This call closed nothing — but it re-applied the row's OWN stored
+    # declaration, and the ledger now holds what the crashed resolve attached.
+    assert not healed.applied
+    assert "re-applied" in healed.detail
+    assert all(write.applied for write in healed.deliverables)
+    rows = watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
+    assert [row.deliverable_class for row in rows] == [
+        "screenshot_set",
+        "store_listing",
+    ]
+    # Idempotent: healing an already-healed row converges.
+    again = resolve_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        provenance=declaration(),
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert not again.applied
+    assert (
+        len(
+            watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["missing"])
+        )
+        == 2
+    )
+
+
+# --- spec §4's requeue verb ----------------------------------------------------
+
+
+def test_requeue_records_when_the_stored_declaration_now_parses(watch_stores):
+    # The reader-was-wrong case: the completion always carried a readable
+    # declaration, but the reader of the day filed it malformed. The row keeps
+    # the event whole, so a requeue after the fix re-classifies without any
+    # re-delivery — and lands exactly what the watch would have.
+    seed_the_capture(watch_stores)
+    envelope = fixture_envelope(WITH_PROVENANCE)
+    watch_stores.quarantine.record(
+        tenant=TENANT,
+        event_id=envelope.event_id,
+        item_ref=envelope.subject.id,
+        reason=QuarantineReason.provenance_malformed,
+        detail="an earlier reader could not parse the declaration",
+        raw_event=envelope.model_dump_json(),
+        occurred_at=envelope.occurred_at,
+    )
+    outcome = requeue_quarantined(
+        TENANT,
+        envelope.event_id,
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert outcome.applied
+    assert outcome.record.status is QuarantineStatus.resolved
+    assert "requeued" in outcome.record.resolution_detail
+    assert all(write.applied for write in outcome.deliverables)
+    rows = watch_stores.deliverables.list_for_item(
+        TENANT, MINTED_ITEM_REFS["provenance"]
+    )
+    assert [row.deliverable_class for row in rows] == [
+        "screenshot_set",
+        "store_listing",
+    ]
+    # Stamped with when the work completed, exactly as the watch would have.
+    assert rows[0].produced_at == envelope.occurred_at
+
+
+def test_requeue_refreshes_a_row_that_is_still_unreadable(watch_stores):
+    seed_the_capture(watch_stores)
+    drive(watch_stores)
+    outcome = requeue_quarantined(
+        TENANT,
+        "pm-evt-0000503",
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert outcome.applied
+    assert outcome.deliverables == ()
+    row = outcome.record
+    assert row.is_open
+    assert row.reason is QuarantineReason.provenance_malformed
+    assert "still unreadable" in row.detail
+    assert row.updated_at is not None
+    # A missing declaration stays missing, on the same refresh.
+    missing = requeue_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert missing.applied
+    assert missing.record.is_open
+    assert missing.record.reason is QuarantineReason.provenance_missing
+    # Nothing recorded either way.
+    assert (
+        watch_stores.deliverables.list_for_item(TENANT, MINTED_ITEM_REFS["malformed"])
+        == []
+    )
+
+
+def test_requeue_refuses_closed_and_missing_rows(watch_stores):
+    seed_the_capture(watch_stores)
+    drive(watch_stores)
+    dismiss_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        quarantine=watch_stores.quarantine,
+        detail="nothing was produced",
+    )
+    refused = requeue_quarantined(
+        TENANT,
+        "pm-evt-0000502",
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert not refused.applied
+    assert refused.record.status is QuarantineStatus.dismissed
+    assert refused.deliverables == ()
+    absent = requeue_quarantined(
+        TENANT,
+        "pm-evt-never-filed",
+        deliverables=watch_stores.deliverables,
+        quarantine=watch_stores.quarantine,
+    )
+    assert not absent.applied
+    assert absent.record is None
 
 
 # --- the crash window ---------------------------------------------------------
@@ -601,7 +1071,7 @@ def test_a_watch_store_failure_stops_the_pass_rather_than_dropping_the_record(
     # the pass with the position un-acked (`intake.py`), and the next pass
     # observes it. The pass stops on the FIRST marketing-minted completion it
     # reaches — every write path touches the quarantine, including the recorded
-    # one (which attempts the guarded self-resolve).
+    # one (which reads for a settled row before writing anything).
     class Broken:
         def __getattr__(self, name):
             raise RuntimeError("quarantine store unreachable")

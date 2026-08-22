@@ -90,9 +90,13 @@ Edge is the first configuration, Snowline itself is the intended second.
   re-delivery converges to one open row and a row an operator already closed
   can never be silently reopened by the stream; each keeps the completion
   event whole and carries an operator-visible reason plus status
-  open/resolved/dismissed. Both closing verbs are guarded transitions:
-  `resolve` attaches provenance after the fact — writing the deliverable rows
-  FIRST and closing second, so a crash between them converges — and `dismiss`
+  open/resolved/dismissed. The operator verbs are guarded transitions:
+  `resolve` attaches provenance after the fact — closing the row FIRST (the
+  attached declaration is persisted on it) and writing the deliverable rows
+  second, so a crash between them re-applies from the row's own stored
+  declaration — `requeue` re-runs the watch's classification over the stored
+  completion (recording and resolving when the declaration now parses,
+  refreshing the open row's reason when it still does not), and `dismiss`
   records the judgment that there was no deliverable. Malformed/unmapped
   EVENTS are the second population and a separate table: an unparseable
   envelope may carry no tenant and no event id at all, so its identity is the
@@ -192,7 +196,10 @@ free-form half of the envelope (§5), listing one or more deliverables (one
 completion may have produced a listing update AND a screenshot set) — and is
 read with the house never-raises classification: a malformed declaration is
 quarantine-with-a-reason-naming-the-defect, never a crash and never silently
-treated as absent. The watch runs as a handler in the same per-event,
+treated as absent. The quarantine row keeps the completion whole, so an
+operator can resolve it by attaching provenance, requeue it through the same
+classification after a reader-side fix, or dismiss it (§4's verbs). The watch
+runs as a handler in the same per-event,
 before-the-ack composition minting uses, so an acked completion is one whose
 deliverable rows (or quarantine row) are durable; a watch store failure stalls
 the pass and the completion re-delivers, because the watch may never DROP an
