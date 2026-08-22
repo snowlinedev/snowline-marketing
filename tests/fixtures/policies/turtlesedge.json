@@ -150,8 +150,6 @@
       },
       "title_template": "Recapture the screenshot set for {entity_id}",
       "body_template": "The screenshot set on {details.deliverable_channel} reflects {details.recorded_versions}; governance now holds {details.current_versions}. Compared: {details.comparison}. Capture happens in the asset plugin — this item tracks the review.",
-      "channels": ["app_store"],
-      "deliverable_classes": ["screenshot_set"],
       "human_owned": true
     },
     {

@@ -224,40 +224,22 @@ class GatewayPolicyProvider:
         timeout: float = 10.0,
     ) -> None:
         self._governance_url = (governance_url or config.governance_url()).rstrip("/")
-        self._client = client
-        self._timeout = timeout
+        self._http = thin_client.GuardedGetter(client=client, timeout=timeout)
 
     def resolve(self, tenant: str) -> ResolutionResult:
         url = f"{self._governance_url}{POLICY_SET_PATH}"
-        params = {"tenant": tenant}
-        try:
-            if self._client is None:
-                # One long-lived client for the provider's lifetime, built
-                # lazily INSIDE the never-raises guard (construction can fail
-                # on a broken SSL_CERT_FILE). A one-shot httpx.get per tenant
-                # would re-handshake TCP on every sweep cycle — sustained
-                # connection churn against governance for no benefit. The
-                # provider is driven by the single-threaded policy sweep;
-                # nothing here is locked.
-                self._client = httpx.Client(timeout=self._timeout)
-            resp = self._client.get(url, params=params, timeout=self._timeout)
-        except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as exc:
-            # A config error must land here as a typed result, not escape the
-            # never-raises contract — and it takes all four arms to guarantee
-            # that. `InvalidURL` is not an `HTTPError` (it subclasses
-            # Exception directly); a base URL malformed enough that the
-            # request never reaches the transport (`http:/gov.example`, a
-            # missing scheme) surfaces as a bare `ValueError` from urllib; and
-            # the lazy `httpx.Client()` construction above raises `OSError`
-            # (FileNotFoundError) on a broken SSL_CERT_FILE — httpx builds the
-            # SSL context eagerly in the constructor. The config typo is
-            # precisely the failure an operator hits, so it is the one this
-            # must not crash on.
-            log.warning("policy resolution for %r failed at %s: %s", tenant, url, exc)
+        # The guarded GET (`thin_client.GuardedGetter`) is where the lazy
+        # long-lived client and the never-raises exception arms live — a
+        # config typo lands as a typed result here, never an escape.
+        resp = self._http.get(url, params={"tenant": tenant})
+        if isinstance(resp, thin_client.RequestFailed):
+            log.warning(
+                "policy resolution for %r failed at %s: %s", tenant, url, resp.detail
+            )
             return PolicyResolutionError(
                 tenant=tenant,
                 failure=ResolutionFailure.unavailable,
-                detail=str(exc),
+                detail=resp.detail,
             )
         if resp.status_code == httpx.codes.NOT_FOUND:
             # A 404 is AMBIGUOUS: "this tenant has no policy artifact" (an

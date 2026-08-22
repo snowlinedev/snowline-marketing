@@ -587,6 +587,13 @@ def test_a_finding_id_is_a_function_of_its_facts_and_nothing_else():
     assert baseline != id_for(
         current_versions=[(MESSAGING, "av-newest"), (LISTING_DOC, "av-77b0e315")]
     )
+    # The pair join cannot be re-partitioned into another finding's: nothing
+    # forbids a printable separator character in an id, so ('x', 'y=z') and
+    # ('x=y', 'z') are different facts and must hash apart — the NUL-inside-
+    # the-pair rule `finding_event_id` documents.
+    assert id_for(current_versions=[("x", "y=z")]) != id_for(
+        current_versions=[("x=y", "z")]
+    )
     assert baseline.startswith("mkt-stale-")
 
 
@@ -616,10 +623,10 @@ def test_synthesized_envelopes_are_legal_envelopes():
     source = SyntheticFindingSource(TENANT, report.findings)
     assert source.source_key == f"staleness:{TENANT}"
     raw = list(source.read())
-    assert [event.position for event in raw] == ["000000", "000001"]
+    assert [event.position for event in raw] == ["0" * 12, "0" * 11 + "1"]
     # Positions are lexicographically monotone (the `EventSource` contract) and
     # `after` filtering rides them.
-    assert [e.position for e in source.read(after="000000")] == ["000001"]
+    assert [e.position for e in source.read(after="0" * 12)] == ["0" * 11 + "1"]
     for event, finding in zip(raw, report.findings):
         parsed = parse_envelope(event.body, ref=event.ref, position=event.position)
         assert isinstance(parsed, EventEnvelope), parsed

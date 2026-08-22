@@ -264,39 +264,22 @@ class GatewayArtifactVersions:
         timeout: float = 10.0,
     ) -> None:
         self._governance_url = (governance_url or config.governance_url()).rstrip("/")
-        self._client = client
-        self._timeout = timeout
+        self._http = thin_client.GuardedGetter(client=client, timeout=timeout)
 
     def resolve(self, artifact_id: str) -> VersionResolution:
         url = f"{self._governance_url}{ARTIFACT_PATH}"
-        params = {"artifact_id": artifact_id}
-        try:
-            if self._client is None:
-                # One long-lived client for the provider's lifetime, built
-                # lazily INSIDE the never-raises guard — same reasoning as
-                # `GatewayPolicyProvider`: construction itself can fail on a
-                # broken SSL_CERT_FILE, and a one-shot request per artifact
-                # would re-handshake TCP on every sweep for no benefit. The
-                # provider is driven by the single-threaded sweep; nothing here
-                # is locked.
-                self._client = httpx.Client(timeout=self._timeout)
-            resp = self._client.get(url, params=params, timeout=self._timeout)
-        except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as exc:
-            # All four arms, for `GatewayPolicyProvider`'s documented reasons:
-            # InvalidURL is not an HTTPError, a scheme-less base URL surfaces as
-            # a bare ValueError from urllib, and the lazy client construction
-            # raises OSError on a broken cert file. A config typo must land here
-            # as a typed result, never escape the never-raises contract.
+        resp = self._http.get(url, params={"artifact_id": artifact_id})
+        if isinstance(resp, thin_client.RequestFailed):
             log.warning(
                 "artifact version resolution for %r failed at %s: %s",
                 artifact_id,
                 url,
-                exc,
+                resp.detail,
             )
             return ArtifactVersionError(
                 artifact_id=artifact_id,
                 failure=VersionFailure.unavailable,
-                detail=str(exc),
+                detail=resp.detail,
             )
         if resp.status_code == httpx.codes.NOT_FOUND:
             # A 404 is AMBIGUOUS — "governance has no such artifact" and "this
@@ -354,8 +337,8 @@ def _read_artifact_payload(artifact_id: str, resp: httpx.Response) -> VersionRes
             detail=f"governance response: {failure.value} — {detail}",
             status_code=resp.status_code,
         )
-    answered = payload.get(_ARTIFACT_ID_KEY)
-    if not isinstance(answered, str) or answered.strip() != artifact_id:
+    answered = classify.best_effort_str(payload, _ARTIFACT_ID_KEY)
+    if answered != artifact_id:
         # The payload must answer the question that was ASKED. A body naming a
         # different artifact (a proxy serving a cached response, a route that
         # ignores its query parameter) would otherwise compare one deliverable's
@@ -393,8 +376,8 @@ def _read_artifact_payload(artifact_id: str, resp: httpx.Response) -> VersionRes
             detail=(f"artifact payload's {_CURRENT_VERSION_KEY!r} is not an object"),
             status_code=resp.status_code,
         )
-    version_id = current.get(_VERSION_ID_KEY)
-    if not isinstance(version_id, str) or not version_id.strip():
+    version_id = classify.best_effort_str(current, _VERSION_ID_KEY)
+    if version_id is None:
         return ArtifactVersionError(
             artifact_id=artifact_id,
             failure=VersionFailure.malformed_response,
@@ -404,12 +387,14 @@ def _read_artifact_payload(artifact_id: str, resp: httpx.Response) -> VersionRes
             ),
             status_code=resp.status_code,
         )
-    milestone = current.get(_MILESTONE_KEY)
     return ArtifactVersion(
         artifact_id=artifact_id,
-        version_id=version_id.strip(),
+        version_id=version_id,
         # An unstamped version reports `milestone: null`, which is an ordinary
-        # state (§8 works without stamps) — so a non-string is simply absent
-        # rather than a reason to reject the whole read.
-        milestone=milestone if isinstance(milestone, str) and milestone else None,
+        # state (§8 works without stamps) — so a non-string or blank value is
+        # simply absent rather than a reason to reject the whole read. The
+        # same `best_effort_str` read as every identifying string here, so a
+        # whitespace-padded stamp cannot disagree with the STRIPPED one
+        # provenance validation recorded and fake a boundary move.
+        milestone=classify.best_effort_str(current, _MILESTONE_KEY),
     )

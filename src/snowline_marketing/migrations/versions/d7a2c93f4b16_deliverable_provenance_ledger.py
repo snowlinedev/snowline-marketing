@@ -60,7 +60,8 @@ def upgrade() -> None:
         # honest completion into a queue meant for MISSING provenance.
         sa.Column("external_url", sa.Text(), nullable=True),
         # The completion event's `occurred_at`, never a producer-declared time.
-        # timestamptz: §8 compares this against release milestone events.
+        # timestamptz: ordering evidence (the upsert guard, §11 listings) must
+        # not argue in local wall time. Not a §8 sweep input — see models.py.
         sa.Column("produced_at", sa.DateTime(timezone=True), nullable=False),
         # `created_at` never moves, so a re-delivery is visible as convergence
         # rather than as a fresh deliverable; `updated_at` is NULL until the

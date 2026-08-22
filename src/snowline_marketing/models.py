@@ -478,8 +478,11 @@ class DeliverableProvenanceEntry(Base):
 
     # When the producing work completed — the completion event's `occurred_at`,
     # never a producer-declared time (see `provenance.py`). timestamptz like
-    # every timestamp here: §8 compares this against release milestone events,
-    # and an ordering argument in local wall time is not an argument.
+    # every timestamp here: this column is ordering evidence (the upsert's
+    # newest-completion-wins guard, §11's listings), and an ordering argument
+    # in local wall time is not an argument. NOT a §8 sweep input: release-
+    # milestone-vs-produced_at was settled OUT of the sweep (spec §8,
+    # 2026-08-22) — release-driven review is a milestone_released event policy.
     produced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

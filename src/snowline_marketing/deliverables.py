@@ -561,12 +561,12 @@ class InMemoryDeliverables:
         it held."""
         rows = sorted(
             (record for record in self._rows.values() if record.tenant == tenant),
-            key=lambda record: (
-                record.created_at,
-                record.item_ref,
-                record.channel,
-                record.deliverable_class,
-            ),
+            # `identity` rather than a hand-rolled tuple, exactly as
+            # `list_for_item` sorts: if the natural key ever gains or reorders
+            # a field, both listings and the DB store's ORDER BY move together
+            # instead of this copy silently drifting. Tenant is constant under
+            # the filter, so its presence in the key is inert.
+            key=lambda record: (record.created_at, *record.identity),
             reverse=True,
         )
         return rows if limit is None else rows[: max(0, limit)]

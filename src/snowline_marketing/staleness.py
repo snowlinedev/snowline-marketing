@@ -224,8 +224,11 @@ def finding_event_id(
 
     `sha256`, never Python's `hash`: the builtin is salted per process, so a
     dedup key built from it would change on every restart and quietly re-mint
-    everything. The fields are joined with NUL, which cannot occur in any of
-    them, so no combination of ids can be re-partitioned into another finding's.
+    everything. EVERY join — between fields AND inside each (artifact id,
+    version id) pair — uses NUL, which cannot occur in any of them, so no
+    combination of ids can be re-partitioned into another finding's. A
+    printable pair separator would break exactly that claim: nothing forbids
+    `=` in an id, and `('x', 'y=z')` / `('x=y', 'z')` must not collide.
 
     The current versions of artifacts that are NOT stale are included too, and
     that changes nothing about when the id moves: a fresh artifact's current
@@ -233,7 +236,7 @@ def finding_event_id(
     becoming stale. Including them keeps the digest a function of the whole
     comparison the finding cites, which is what §14 says a finding is about."""
     pairs = sorted(
-        f"{artifact_id}={version_id}" for artifact_id, version_id in current_versions
+        f"{artifact_id}\0{version_id}" for artifact_id, version_id in current_versions
     )
     identity = "\0".join((tenant, item_ref, channel, deliverable_class, *pairs))
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -376,6 +379,7 @@ class StalenessFinding:
         the mint loudly (`rendering.RenderFailure`), which is the honest
         signal."""
         record = self.deliverable
+        stale = self.stale
         details: dict[str, str] = {
             "deliverable_channel": record.channel,
             "deliverable_class": record.deliverable_class,
@@ -384,7 +388,7 @@ class StalenessFinding:
             # The artifacts whose versions moved — the finding's cause, on its
             # own, for a title that has no room for the full comparison.
             "stale_artifacts": _LIST_SEPARATOR.join(
-                comparison.artifact_id for comparison in self.stale
+                comparison.artifact_id for comparison in stale
             ),
             # Both sides of the whole compared set, verbatim (§14).
             "recorded_versions": _versions_text(
@@ -400,7 +404,7 @@ class StalenessFinding:
             "comparison": _COMPARISON_SEPARATOR.join(
                 f"{comparison.artifact_id}: recorded {comparison.recorded_version_id} "
                 f"→ current {comparison.current_version_id}"
-                for comparison in self.stale
+                for comparison in stale
             ),
             "observed_at": self.observed_at.isoformat(),
         }
@@ -606,7 +610,12 @@ class SyntheticFindingSource:
 
     def read(self, *, after: str | None = None):
         for index, finding in enumerate(self._findings):
-            position = f"{index:06d}"
+            # 12 digits keeps the zero-padding lexicographically monotone up
+            # to a trillion findings per sweep — the contract `sources.py`
+            # protects, held by a margin no real sweep approaches, rather than
+            # by an unstated assumption a 6-digit pad would break at the
+            # 1,000,001st finding.
+            position = f"{index:012d}"
             if after is not None and position <= after:
                 continue
             yield RawEvent(

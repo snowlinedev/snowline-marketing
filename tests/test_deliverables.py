@@ -294,6 +294,31 @@ def test_list_for_tenant_breaks_ties_by_the_natural_key():
 # --- DB-only: the constraints and the §11 listing -----------------------------
 
 
+def test_db_listing_breaks_a_real_timestamp_tie_by_the_natural_key(migrated_db):
+    # The in-memory twin proves the tie-break with a frozen clock; the real
+    # store's `func.now()` is per transaction, so the tie is forced the only
+    # way Postgres allows — raw inserts with an explicit `created_at`,
+    # bypassing the upsert's server-side default — and the ORDER BY's tie
+    # columns are exercised against the database itself, not a Python sort
+    # imitating them.
+    tied = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    with session_scope() as session:
+        for channel in ("website", "app_store", "blog"):
+            session.execute(
+                sa.insert(DeliverableRow).values(
+                    tenant=TENANT,
+                    item_ref=ITEM,
+                    channel=channel,
+                    deliverable_class="store_listing",
+                    produced_at=PRODUCED_AT,
+                    event_id="pm-evt-0000501",
+                    created_at=tied,
+                )
+            )
+    rows = DeliverableProvenanceLedger().list_for_tenant(TENANT)
+    assert [row.channel for row in rows] == ["website", "blog", "app_store"]
+
+
 def test_a_source_version_cannot_outlive_its_deliverable(migrated_db):
     # The foreign key: a source version with no deliverable is a fact about
     # nothing, and the invariant is the DATABASE's rather than every future

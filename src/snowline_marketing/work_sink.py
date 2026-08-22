@@ -399,8 +399,10 @@ class PMWorkItemSink:
                 # One long-lived client, built lazily INSIDE the never-raises
                 # guard: httpx builds its SSL context in the constructor, so a
                 # broken SSL_CERT_FILE raises OSError here rather than at
-                # request time (same reasoning, and the same four-arm except,
-                # as `policy_source.GatewayPolicyProvider.resolve`).
+                # request time (`thin_client.GuardedGetter`'s reasoning). NOT
+                # the shared getter itself, deliberately: a POST must split
+                # "provably never sent" from "sent, fate unknown", which the
+                # GET skeleton's single failure bucket cannot express.
                 self._client = httpx.Client(timeout=self._timeout)
             response = self._client.post(
                 self._url, json=request.payload(), timeout=self._timeout
