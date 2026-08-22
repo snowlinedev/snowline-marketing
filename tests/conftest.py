@@ -11,6 +11,19 @@ inherit a safe default without each one having to remember to set it.
 malformed cases), shared by the source, intake-loop and envelope tests so they
 all assert against the SAME capture rather than each inventing its own.
 
+`completion_fixtures_dir` points at `tests/fixtures/completions/` — the §8
+provenance-watch capture: completions of marketing-minted items (with full
+provenance, without any, and with a malformed declaration) plus one completion
+of an item this plugin never minted. A SECOND capture rather than four more
+files in `events/`, for two reasons that both bite. (1) Those completions only
+mean anything against `created` delivery-ledger rows a test seeds for their
+subject ids — a fact about the LEDGER, not about the stream, and one the shared
+capture's other consumers would have to be told to ignore. (2) A completion is
+an `item_completed` event, so folding them in would change what the shipped
+policy artifact matches and mints, silently re-baselining every count the
+minting, dry-run and engine suites assert. Two captures, each asserting one
+thing.
+
 `policy_fixtures_dir` points at `tests/fixtures/policies/` — Turtle's Edge's
 policy-set document (every consequence type, both the default and custom
 dedup templates) plus one file per malformed class. Unlike the event fixtures
@@ -43,6 +56,22 @@ EVENT_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "events"
 # tested against these, with the gateway an integration point rather than a
 # build prerequisite.
 POLICY_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "policies"
+
+# The shipped completion capture (spec §8's provenance watch — see the module
+# docstring on why it is its own directory).
+COMPLETION_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "completions"
+
+# The item refs the completion capture names. Declared here because the WATCH
+# tests have to seed `created` delivery-ledger rows for exactly these refs
+# (that join is what makes a completion marketing-minted), so the fixture and
+# the seed cannot drift apart on identity — the same reason TENANT and SCOPE
+# live here.
+MINTED_ITEM_REFS = {
+    "provenance": "mkt-item-0001",
+    "missing": "mkt-item-0002",
+    "malformed": "mkt-item-0003",
+}
+NEVER_MINTED_ITEM_REF = "roadmap-item-9999"
 
 # Point marketing's DB layer at the disposable test database BEFORE any
 # marketing module builds its (lazy) engine.
@@ -185,6 +214,12 @@ def _marketing_stays_disabled(monkeypatch):
 def event_fixtures_dir() -> Path:
     """The shipped event capture directory (see module docstring)."""
     return EVENT_FIXTURES_DIR
+
+
+@pytest.fixture
+def completion_fixtures_dir() -> Path:
+    """The shipped completion capture directory (see module docstring)."""
+    return COMPLETION_FIXTURES_DIR
 
 
 @pytest.fixture

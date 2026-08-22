@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000504",
+  "event_type": "item_completed",
+  "tenant": "turtlesedge",
+  "occurred_at": "2026-07-28T15:20:44+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "roadmap-item-9999"
+  },
+  "payload": {
+    "scope": "turtlesedge/turtletracks",
+    "initiative": "summer-release",
+    "milestone": "v1.4",
+    "work_kind": "implementation",
+    "relations": [
+      {"kind": "marketing-impact", "target": "8ad41b77"}
+    ],
+    "signals": ["marketing-impact"],
+    "details": {
+      "title": "Offline trip log sync, phase two"
+    }
+  }
+}

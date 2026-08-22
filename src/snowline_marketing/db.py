@@ -7,15 +7,19 @@ point at a disposable database and avoids connecting just by importing the
 package.
 
 The models so far are the intake `ConsumerCursor`, the `CachedPolicySet` policy
-cache and the `DeliveryLedgerEntry` delivery ledger (spec §4); the provenance
-and quarantine tables arrive with their own items. Everything here is
-model-agnostic — it owns connections, not schema.
+cache, the `DeliveryLedgerEntry` delivery ledger, the `DeliverableProvenanceEntry`
+(+ `DeliverableSourceVersion`) provenance ledger and the
+`CompletionQuarantineEntry` completion quarantine (spec §4); the malformed-event
+quarantine arrives with the operator surfaces that read it (§11). Everything
+here is model-agnostic — it owns connections (and the one shared clock,
+`utc_now`), not schema.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from alembic.config import Config as AlembicConfig
@@ -28,6 +32,15 @@ _engine: Engine | None = None
 _sessionmaker: sessionmaker[Session] | None = None
 
 MIGRATIONS = Path(__file__).resolve().parent / "migrations"
+
+
+def utc_now() -> datetime:
+    """The in-memory stores' default clock — the in-process stand-in for the
+    timestamptz `func.now()` the real stores' columns default to. One home
+    (ledger, deliverables and quarantine all default their injectable `clock`
+    to it), because three private copies of "now, in UTC" are three places a
+    naive datetime could sneak in."""
+    return datetime.now(timezone.utc)
 
 
 def alembic_config(url: str | None = None) -> AlembicConfig:

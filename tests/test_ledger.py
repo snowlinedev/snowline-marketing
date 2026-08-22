@@ -393,6 +393,24 @@ def test_release_stale_claim_is_the_declared_exit_from_a_claim(ledger_store):
     assert refused.record.outcome is DeliveryOutcome.created
 
 
+def test_created_rows_are_findable_by_the_item_they_minted(ledger_store):
+    # The provenance watch's join (spec §8): a completion whose subject matches a
+    # `created` row is a marketing-minted completion, and one that matches
+    # nothing is ordinary roadmap work. On BOTH stores, because the watch is
+    # developed fixtures-first and a join the dry-run store could not answer
+    # would leave it with no fixtures-first path at all.
+    _claimed(ledger_store)
+    assert ledger_store.created_for_item(TENANT, "pm-item-42") == []
+    ledger_store.confirm_created(TENANT, STORED_KEY, item_ref="pm-item-42")
+    (row,) = ledger_store.created_for_item(TENANT, "pm-item-42")
+    assert row.dedup_key == STORED_KEY
+    assert row.outcome is DeliveryOutcome.created
+    # Only `created` rows carry a ref, so nothing else can be reached this way…
+    assert ledger_store.created_for_item(TENANT, "never-minted") == []
+    # …and the join is isolated per tenant like every other read here.
+    assert ledger_store.created_for_item("snowlinedev", "pm-item-42") == []
+
+
 def test_a_transition_on_a_row_that_does_not_exist_reports_neither(ledger_store):
     transition = ledger_store.claim(TENANT, "p:never-recorded")
     assert not transition.applied

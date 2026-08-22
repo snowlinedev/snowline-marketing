@@ -8,13 +8,18 @@ edge case hardened in one classifier must not have to be remembered in the
 other (`UnicodeDecodeError` already had to be added to both before this module
 existed). The classifiers keep their own result types, reason enums and
 best-effort keys; what they share is the skeleton, not the vocabulary.
+
+Shared validation-reporting helpers live here too (`duplicates`): the small
+shapes several validators phrase the same refusal with, kept in one place so
+the phrasing's inputs cannot drift between the modules that report them.
 """
 
 from __future__ import annotations
 
 import enum
 import json
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Hashable, Iterable, Mapping
 from typing import Any
 
 from pydantic import ValidationError
@@ -61,6 +66,18 @@ def decode_json_object(
             f"expected a JSON object, got {type(body).__name__}",
         )
     return body, None
+
+
+def duplicates[T: Hashable](items: Iterable[T]) -> list[T]:
+    """The values appearing more than once in `items`, sorted.
+
+    The shared shape of every "each X exactly once" refusal — the payload
+    validators in `provenance.py` and the store guard in
+    `deliverables._validated_versions` all report exactly this list. Sorted so
+    a detail line names the offenders deterministically whatever order the
+    input listed them in."""
+    counts = Counter(items)
+    return sorted(item for item, count in counts.items() if count > 1)
 
 
 def best_effort_str(body: Mapping[str, Any], key: str) -> str | None:

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000503",
+  "event_type": "item_completed",
+  "tenant": "turtlesedge",
+  "occurred_at": "2026-07-28T13:47:11+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "mkt-item-0003"
+  },
+  "payload": {
+    "scope": "turtlesedge/marketing",
+    "initiative": "messaging",
+    "work_kind": "marketing",
+    "details": {
+      "title": "Refresh the positioning copy",
+      "deliverable_provenance": {
+        "schema_version": 1,
+        "deliverables": [
+          {
+            "channel": "website",
+            "source_artifact_versions": []
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,931 @@
+"""The provenance watch — completions in, deliverable rows or quarantine out
+(spec §8).
+
+Spec §8, settled 2026-07-18: "completing a marketing-minted item is watched via
+the same PM event stream; a completion carrying a provenance payload (channel,
+deliverable class, source artifact versions, URL) upserts the deliverable
+ledger; a completion without one lands in quarantine — visible, auditable,
+resolvable by attaching provenance after the fact. **No hard completion gate, no
+friction on the PM verb itself.**"
+
+This module is that watch. It decides; `deliverables.py` and `quarantine.py`
+store; `provenance.py` says what a declaration looks like. Nothing here calls
+PM — by the time an `item_completed` event arrives the verb has already
+happened, and the watch's entire job is to RECORD what it produced.
+
+**How a marketing-minted completion is recognized: the delivery ledger's
+`created_item_ref`.** That column is written at mint time by the one transition
+allowed to write it (`ledger.confirm_created`, §7), so it is the authoritative
+statement that THIS plugin created THAT item. A completion whose subject id
+matches a `created` row is a marketing-minted completion; one that matches
+nothing is ordinary roadmap work and is passed through SILENTLY — no row, no
+log, no quarantine. That silence is a requirement, not an economy: the marketing
+plugin consumes the whole PM lifecycle stream (§5), so most completions it sees
+belong to other people's work, and a plugin that filed observations about them
+would be inventing a second backlog (§1) out of other teams' items.
+
+The alternatives were considered and are worse. A naming convention on the item
+would be §3's forbidden "infers the roadmap from GitHub naming conventions" in
+another costume. A marker inside the item BODY (the §7 provenance block) is
+producer-editable text that PM does not carry on the event at all. A PM lookup
+per completion would make the watch depend on PM being reachable to decide
+whether an event is its business — a read the plugin does not need, since it
+already recorded the answer when it minted.
+
+**A completion NEVER fails because of the watch.** Spec §8's "no hard completion
+gate" is upheld structurally: nothing here can call a PM verb, and the only
+things it writes are two local tables. What it does NOT do is drop the
+observation when a store is down — a watch store failure RAISES, which
+`intake.run_intake` turns into a stopped pass with the event un-acked, so the
+completion re-delivers and is observed later. Same posture as
+`engine.EvaluationStalledError` and `minting.MintingUnavailableError`, and the
+same reason: an acked event is the loop's statement that the event is DONE, and
+an observation that was never recorded is not done.
+
+**Watch BEFORE mint, both before the ack.** `ProvenanceWatchHandler` extends
+`minting.MintingEvaluationHandler` and runs the watch first, then the parent's
+evaluate-and-mint. Order matters in exactly one direction: the mint half can
+stop the pass when PM is unavailable (`MintingUnavailableError`), and a
+completion that already happened should not have its provenance recorded late
+because an unrelated mint could not reach PM. The reverse ordering has no
+compensating benefit — the watch's join reads `created` rows written by EARLIER
+events, never by the event in hand (an item cannot complete in the same event
+that minted it), so nothing the mint does this pass changes what the watch would
+see.
+
+Everything is convergent under at-least-once re-delivery, which is what makes
+the crash window harmless: the deliverable ledger upserts newest-completion-
+wins (a re-declared deliverable lands on the same row, and a STALE re-delivery
+arriving after a newer completion recorded is refused per deliverable and
+surfaced as superseded), and the quarantine files first-writer-wins (a
+re-delivered provenance-less completion converges to ONE open row, and cannot
+reopen a decision an operator already made — a completion whose own row was
+already closed skips recording entirely, see `watch_completion`).
+"""
+
+from __future__ import annotations
+
+import enum
+import logging
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
+
+from snowline_marketing.cursors import CursorStore
+from snowline_marketing.deliverables import (
+    DeliverableProvenanceLedger,
+    DeliverableRecord,
+    DeliverableStore,
+    DeliverableWrite,
+    SourceVersion,
+)
+from snowline_marketing.engine import EvaluationStalled, PolicyResolution
+from snowline_marketing.events import EventEnvelope, EventType
+from snowline_marketing.intake import IntakeResult, MalformedHandler
+from snowline_marketing.ledger import (
+    DeliveryLedger,
+    LedgerRecord,
+    MintingLedger,
+)
+from snowline_marketing.minting import (
+    IntakeMintResult,
+    MintingEvaluationHandler,
+    MintOutcome,
+    MintPassReport,
+    drive_intake,
+)
+from snowline_marketing.policy_cache import PolicyCacheStore
+from snowline_marketing.policy_source import PolicyProvider
+from snowline_marketing.provenance import (
+    DeclaredDeliverable,
+    DeliverableProvenance,
+    MissingProvenance,
+    parse_provenance,
+)
+from snowline_marketing.quarantine import (
+    CompletionQuarantine,
+    QuarantineReason,
+    QuarantineRecord,
+    QuarantineStatus,
+    QuarantineStore,
+    QuarantineTransition,
+)
+from snowline_marketing.sources import EventSource
+from snowline_marketing.work_sink import WorkItemSink
+
+log = logging.getLogger("snowline_marketing.watch")
+
+
+class MintedItemLookup(Protocol):
+    """What the watch needs to answer "did this plugin mint that item?" — the
+    delivery ledger's `created_item_ref` join, and nothing else it ever calls.
+
+    A narrow protocol for `ledger.LedgerStore`'s reason: `watch_completion` must
+    be unable to write a delivery-ledger row, and taking the narrowest surface is
+    how that is stated rather than promised."""
+
+    def created_for_item(self, tenant: str, item_ref: str) -> list[LedgerRecord]: ...
+
+
+class WatchLedger(MintingLedger, MintedItemLookup, Protocol):
+    """What `ProvenanceWatchHandler` needs from a delivery ledger: the minting
+    surface its parent already requires, plus the watch's join.
+
+    Declared as the union rather than as a second parameter because there is only
+    ever ONE ledger — the row the engine writes is the row the mint transitions
+    and the row the watch joins against, and two stores would mean two ledgers.
+    Both `DeliveryLedger` and `InMemoryDeliveryLedger` satisfy it."""
+
+
+class WatchDisposition(enum.StrEnum):
+    """What the watch did with one event.
+
+    Distinct from anything the stores say, for `minting.MintDisposition`'s
+    reason: this is the PASS's report, and several dispositions leave no row at
+    all — which is precisely the fact a driver wants to see counted."""
+
+    # A marketing-minted completion declared its deliverables and the ledger
+    # holds them (spec §8's upsert path).
+    recorded = "recorded"
+    # A marketing-minted completion declared nothing — spec §8's "a completion
+    # without one". Filed, open, resolvable.
+    quarantined_missing = "quarantined_missing"
+    # A declaration was attempted and could not be read. Filed with a detail
+    # naming the defect — a producer's bug, not an operator's omission.
+    quarantined_malformed = "quarantined_malformed"
+    # The completed item was never minted by this plugin: ordinary roadmap
+    # work, none of the watch's business. Nothing written, nothing logged.
+    not_marketing_minted = "not_marketing_minted"
+    # A marketing-minted completion re-delivered with provenance AFTER its own
+    # quarantine row was closed. A dismissed row is an operator's explicit
+    # "nothing was produced" and a resolved one was already applied — either
+    # way the observation is settled, and the re-delivery converges as a quiet
+    # no-op rather than overriding a decision. Nothing written, DEBUG-logged.
+    already_settled = "already_settled"
+    # Not an `item_completed` event at all. Every other event type flows through
+    # the handler untouched.
+    not_a_completion = "not_a_completion"
+    # The envelope belongs to another tenant. The engine quarantines that
+    # DELIVERY (§14); the watch writes nothing under a tenant it does not own.
+    foreign_tenant = "foreign_tenant"
+
+
+@dataclass(frozen=True)
+class WatchOutcome:
+    """One event, watched (or deliberately not).
+
+    Carries the whole envelope for `minting.MintOutcome`'s reason: every caller
+    that reports on a pass wants a different projection of it, and a hand-copied
+    subset falls behind the day the schema grows.
+
+    `minted_by` is the `created` delivery-ledger row that made this completion
+    the watch's business — non-None exactly for the dispositions that acted, so
+    an operator reading a quarantine row can get from it to the policy that
+    minted the item in the first place.
+
+    `deliverables` carries the WRITES, not bare records
+    (`deliverables.DeliverableWrite`): a `recorded` outcome may include
+    declarations the ledger refused because a newer completion's facts already
+    stand, and `superseded` is that subset surfaced by name."""
+
+    envelope: EventEnvelope
+    disposition: WatchDisposition
+    deliverables: tuple[DeliverableWrite, ...] = ()
+    quarantine: QuarantineRecord | None = None
+    minted_by: LedgerRecord | None = None
+    detail: str | None = None
+
+    @property
+    def superseded(self) -> tuple[DeliverableRecord, ...]:
+        """The standing rows that REFUSED this completion's declarations — a
+        stale outbox re-delivery landing after a newer completion recorded
+        converges as exactly these no-ops (`deliverables.DeliverableWrite`)."""
+        return tuple(write.record for write in self.deliverables if not write.applied)
+
+    @property
+    def tenant(self) -> str:
+        return self.envelope.tenant
+
+    @property
+    def event_id(self) -> str:
+        return self.envelope.event_id
+
+    @property
+    def item_ref(self) -> str:
+        """The completed item's ref — the envelope's subject id, which for an
+        `item_completed` event is a work item by validation (`events.py`).
+
+        Meaningful only for the dispositions that looked at an item; on a
+        `not_a_completion` outcome the subject may be a milestone or a
+        schedule, and reading this would be asking a question the outcome did
+        not answer."""
+        return self.envelope.subject.id
+
+    @property
+    def needs_operator(self) -> bool:
+        """Whether this outcome is one §11's quarantine surface exists for. True
+        for both quarantine dispositions and nothing else: a pass-through is not
+        a problem and a recorded deliverable is the system working."""
+        return self.disposition in (
+            WatchDisposition.quarantined_missing,
+            WatchDisposition.quarantined_malformed,
+        )
+
+
+@dataclass(frozen=True)
+class WatchPassReport:
+    """What one watch pass observed, in event order."""
+
+    outcomes: tuple[WatchOutcome, ...]
+
+    @property
+    def counts(self) -> Mapping[WatchDisposition, int]:
+        """Totals, DERIVED from `outcomes` — stored counts could disagree with
+        the lines they summarize; a property cannot (same reasoning as
+        `minting.MintPassReport.counts`)."""
+        return Counter(outcome.disposition for outcome in self.outcomes)
+
+    @property
+    def recorded(self) -> tuple[WatchOutcome, ...]:
+        """The completions whose deliverables this pass wrote."""
+        return tuple(
+            outcome
+            for outcome in self.outcomes
+            if outcome.disposition is WatchDisposition.recorded
+        )
+
+    @property
+    def quarantined(self) -> tuple[WatchOutcome, ...]:
+        """Everything a human has to resolve — §11's quarantine input, surfaced
+        by the pass that produced it rather than left to be discovered by a
+        query."""
+        return tuple(outcome for outcome in self.outcomes if outcome.needs_operator)
+
+
+def _source_versions(deliverable: DeclaredDeliverable) -> tuple[SourceVersion, ...]:
+    """The declared versions as the STORE's record type.
+
+    A conversion rather than one shared type: `provenance.SourceArtifactVersion`
+    is a wire declaration this plugin validates and `deliverables.SourceVersion`
+    is a row it owns, and the seam between them is what keeps the store free of
+    any opinion about the payload schema (`ledger.py` is free of `policies.py`
+    for the same reason)."""
+    return tuple(
+        SourceVersion(
+            artifact_id=version.artifact_id,
+            version_id=version.version_id,
+            milestone=version.milestone,
+        )
+        for version in deliverable.source_artifact_versions
+    )
+
+
+def _record_deliverables(
+    *,
+    tenant: str,
+    item_ref: str,
+    event_id: str,
+    produced_at: datetime,
+    provenance: DeliverableProvenance,
+    deliverables: DeliverableStore,
+) -> tuple[DeliverableWrite, ...]:
+    """Upsert every declared deliverable, in declaration order — each write
+    reporting whether it applied or was superseded by a newer completion's
+    facts (`deliverables.DeliverableWrite`).
+
+    Shared by the watch, `resolve_quarantined` and `requeue_quarantined` so
+    that provenance attached AFTER the fact lands exactly as provenance carried
+    ON the completion would have — same rows, same key, same convergence. A
+    resolve that wrote a different shape than the watch would make the ledger's
+    contents depend on how late the operator was."""
+    return tuple(
+        deliverables.upsert(
+            tenant=tenant,
+            item_ref=item_ref,
+            channel=declared.channel,
+            deliverable_class=declared.deliverable_class,
+            source_versions=_source_versions(declared),
+            produced_at=produced_at,
+            event_id=event_id,
+            external_url=declared.external_url,
+        )
+        for declared in provenance.deliverables
+    )
+
+
+def _self_resolved_detail(event_id: str) -> str:
+    """What the watch writes into a quarantine row's `resolution_detail` when a
+    completion of the same ITEM records provenance — crediting the recording
+    event, because the closed row may belong to a DIFFERENT (earlier)
+    completion event and its story must say which delivery settled it. One
+    phrasing, here, so a test asserts on the state rather than on a wording it
+    copied."""
+    return (
+        f"provenance recorded by completion {event_id} — the deliverable "
+        "ledger now holds what this item produced, so the row closed itself "
+        "(spec §8)"
+    )
+
+
+def watch_completion(
+    envelope: EventEnvelope,
+    *,
+    tenant: str,
+    ledger: MintedItemLookup,
+    deliverables: DeliverableStore,
+    quarantine: QuarantineStore,
+) -> WatchOutcome:
+    """Watch one event (spec §8).
+
+    Four gates, in this order, each cheaper than the next and each a documented
+    pass-through: not a completion, not this tenant's, not minted by this plugin,
+    then — and only then — read the provenance declaration and write. A fifth
+    check guards the write itself: a readable declaration whose own quarantine
+    row was already CLOSED is a settled observation, and skips recording
+    (`WatchDisposition.already_settled`).
+
+    `tenant` is passed rather than read off the envelope: the watch belongs to
+    ONE tenant's pass (the handler holds it), and joining against the envelope's
+    own claim would let a misrouted event decide which org's ledger it lands in.
+    That is the §3/§14 boundary, and it is held here as well as at the engine
+    because a boundary held in exactly one place is one refactor away from not
+    being held at all.
+
+    Raises nothing of its own; a store that cannot be written raises through, and
+    the intake loop turns that into a stopped pass with the event un-acked (see
+    the module docstring)."""
+    if envelope.event_type is not EventType.item_completed:
+        # Every other event type flows through untouched. Deliverables are
+        # produced by completed WORK; a reopened or re-scoped item has produced
+        # nothing new to record.
+        return WatchOutcome(envelope, WatchDisposition.not_a_completion)
+    if envelope.tenant != tenant:
+        return WatchOutcome(
+            envelope,
+            WatchDisposition.foreign_tenant,
+            detail=(
+                f"envelope declares tenant {envelope.tenant!r}, watched for "
+                f"{tenant!r} — nothing recorded; the delivery itself is "
+                "quarantined by the engine (spec §14)"
+            ),
+        )
+    item_ref = envelope.subject.id
+    minted = ledger.created_for_item(tenant, item_ref)
+    if not minted:
+        # Ordinary roadmap work completing. SILENTLY — see the module docstring
+        # on why filing anything here would be inventing a second backlog out of
+        # other teams' items.
+        return WatchOutcome(envelope, WatchDisposition.not_marketing_minted)
+
+    origin = minted[0]
+    parsed = parse_provenance(envelope)
+    if isinstance(parsed, MissingProvenance):
+        reason = (
+            QuarantineReason.provenance_missing
+            if parsed.is_absent
+            else QuarantineReason.provenance_malformed
+        )
+        detail = (
+            f"{parsed.detail} — completion of marketing-minted item "
+            f"{item_ref!r} (delivery {origin.dedup_key!r}, policy "
+            f"{origin.policy_id!r})"
+        )
+        write = quarantine.record(
+            tenant=tenant,
+            event_id=envelope.event_id,
+            item_ref=item_ref,
+            reason=reason,
+            detail=detail,
+            # The completion, whole: `intake.run_intake` only ever hands a
+            # handler a VALID envelope (malformed ones never reach one), so the
+            # parsed event IS the whole event, and the resolve verb reads it.
+            raw_event=envelope.model_dump_json(),
+            occurred_at=envelope.occurred_at,
+        )
+        if write.inserted:
+            # Once per observation, not once per delivery: `inserted` is the
+            # entitlement to treat this as news (`quarantine.QuarantineWrite`),
+            # so a re-delivered completion does not re-warn about a row an
+            # operator may already be working.
+            log.warning(
+                "completion of marketing-minted item %r (tenant %r, event %r) "
+                "recorded no deliverable provenance — quarantined as %s",
+                item_ref,
+                tenant,
+                envelope.event_id,
+                reason.value,
+            )
+        return WatchOutcome(
+            envelope,
+            (
+                WatchDisposition.quarantined_missing
+                if parsed.is_absent
+                else WatchDisposition.quarantined_malformed
+            ),
+            quarantine=write.record,
+            minted_by=origin,
+            detail=detail,
+        )
+
+    # A closed row for THIS event means its observation was already settled:
+    # a resolved row was applied (recording again would race the produced_at
+    # guard for no reason), and a dismissed row is an operator's explicit
+    # "nothing was produced", which a re-delivery must not override with
+    # deliverable rows nobody reviewed. One PK get, marketing completions
+    # only — the only quarantine read the recorded path makes.
+    settled = quarantine.get(tenant, envelope.event_id)
+    if settled is not None and not settled.is_open:
+        log.debug(
+            "completion %r (tenant %r) re-delivered with provenance, but its "
+            "quarantine row is already %s — observation settled, nothing "
+            "recorded",
+            envelope.event_id,
+            tenant,
+            settled.status.value,
+        )
+        return WatchOutcome(
+            envelope,
+            WatchDisposition.already_settled,
+            quarantine=settled,
+            minted_by=origin,
+            detail=(
+                f"quarantine row for completion {envelope.event_id!r} is "
+                f"already {settled.status.value} — nothing recorded"
+            ),
+        )
+
+    writes = _record_deliverables(
+        tenant=tenant,
+        item_ref=item_ref,
+        event_id=envelope.event_id,
+        produced_at=envelope.occurred_at,
+        provenance=parsed,
+        deliverables=deliverables,
+    )
+    # An EARLIER provenance-less completion of this item left an open row; this
+    # completion's provenance is recorded, so the row has nothing left to ask
+    # for. Keyed on the ITEM, not the event: the open row may carry a different
+    # event id (completed provenance-less, reopened, completed again), and an
+    # event-keyed close would leave it open forever. One guarded UPDATE, no
+    # read first and no read-back — the guard IS the check (only open rows
+    # match, so a decision an operator already made is untouchable), and the
+    # ordinary case on this hot path is the UPDATE matching nothing. The
+    # deliverables are written FIRST: the rows being closed over are already
+    # durable in the ledger, which is what the crediting detail points at.
+    quarantine.resolve_open_for_item(
+        tenant, item_ref, detail=_self_resolved_detail(envelope.event_id)
+    )
+    return WatchOutcome(
+        envelope,
+        WatchDisposition.recorded,
+        deliverables=writes,
+        minted_by=origin,
+    )
+
+
+@dataclass(frozen=True)
+class ResolutionOutcome:
+    """The result of attaching provenance to a quarantined completion.
+
+    `applied` is the quarantine transition's — True exactly when THIS call
+    closed the row. `deliverables` is what was written AFTER the close applied
+    (`resolve_quarantined` closes first), as writes, so a declaration the
+    ledger refused as superseded by a newer completion is tellable from one it
+    applied. On a refusal it is empty — a closed row must never be a channel
+    for writing deliverable rows nobody reviewed — with ONE exception: a row
+    already RESOLVED re-applies its OWN stored declaration (the healing path),
+    and `deliverables` reports what that convergence touched."""
+
+    record: QuarantineRecord | None
+    applied: bool
+    deliverables: tuple[DeliverableWrite, ...] = ()
+    detail: str | None = None
+
+    @property
+    def superseded(self) -> tuple[DeliverableRecord, ...]:
+        """The standing rows that refused this resolution's declarations — a
+        stale row resolved after a newer completion recorded converges as
+        exactly these no-ops (`deliverables.DeliverableWrite`)."""
+        return tuple(write.record for write in self.deliverables if not write.applied)
+
+
+def resolve_quarantined(
+    tenant: str,
+    event_id: str,
+    *,
+    provenance: DeliverableProvenance,
+    deliverables: DeliverableStore,
+    quarantine: QuarantineStore,
+    note: str | None = None,
+) -> ResolutionOutcome:
+    """Spec §8's "resolvable by attaching provenance after the fact".
+
+    The operator verb, composed of two durable steps in a deliberate order: the
+    quarantine row is closed FIRST — a guarded open->resolved compare-and-set
+    that persists the attached declaration verbatim on the row
+    (`attached_provenance`) — and the deliverable rows are upserted SECOND,
+    only when the close APPLIED. That makes the empty-on-refusal contract true
+    under the race: two operators resolving one row settle in the store, and
+    the loser's declaration provably never touches the ledger (under the
+    reverse, write-first order it already had).
+
+    The remaining crash window is between the close and the upserts: a
+    RESOLVED row whose deliverables are not yet written. That direction is
+    chosen deliberately — the declaration is durable on the row, so nothing is
+    lost, and re-invoking this verb on the row re-applies the STORED
+    declaration idempotently (the healing path below; §11's surface, or an
+    operator retrying, converges it). The reverse order's window was worse:
+    durable ledger rows nobody reviewed, standing beside a row an operator
+    might then dismiss.
+
+    Refuses without writing anything when the row does not exist or was
+    DISMISSED. On a row already RESOLVED, the healing path runs instead: the
+    row's OWN stored declaration — never the caller's, because a closed row
+    must not become a channel for new unreviewed rows — is re-applied through
+    the same guarded upserts, converging to a no-op if they already landed.
+    `applied` stays False either way: this call closed nothing.
+
+    `provenance` is a PARSED declaration, so an operator's attachment goes
+    through exactly the validation a producer's would
+    (`provenance.parse_provenance`); this function cannot be handed a shape the
+    watch would have quarantined.
+
+    The row's OWN facts supply everything but the declaration: the item ref it
+    was filed against and the completion's `occurred_at` as `produced_at`, so a
+    deliverable recorded late is stamped with when the work actually completed
+    rather than when someone got round to filing it — and the ledger's
+    newest-completion-wins guard therefore refuses the attachment (reported
+    via `superseded`) if a newer completion recorded while the row sat open."""
+    detail = "provenance attached after the fact: " + ", ".join(
+        f"{declared.channel}/{declared.deliverable_class}"
+        for declared in provenance.deliverables
+    )
+    if note:
+        detail = f"{detail} — {note}"
+    transition: QuarantineTransition = quarantine.resolve(
+        tenant,
+        event_id,
+        detail=detail,
+        attached_provenance=provenance.model_dump_json(),
+    )
+    row = transition.record
+    if transition.applied:
+        assert row is not None  # the CAS applied, so the row exists
+        written = _record_deliverables(
+            tenant=tenant,
+            item_ref=row.item_ref,
+            event_id=row.event_id,
+            produced_at=row.occurred_at,
+            provenance=provenance,
+            deliverables=deliverables,
+        )
+        return ResolutionOutcome(
+            record=row, applied=True, deliverables=written, detail=detail
+        )
+    if row is None:
+        return ResolutionOutcome(
+            record=None,
+            applied=False,
+            detail=(
+                f"no quarantined completion {event_id!r} for tenant {tenant!r} — "
+                "nothing written"
+            ),
+        )
+    if row.status is QuarantineStatus.resolved and row.attached_provenance:
+        # The healing path: an earlier resolve closed the row and crashed (or
+        # was refused mid-write) before its deliverables landed. The stored
+        # declaration is what that resolve was closing over, so re-applying it
+        # converges — the upserts land on the same rows, or report superseded
+        # if a newer completion has recorded since.
+        healed = _record_deliverables(
+            tenant=tenant,
+            item_ref=row.item_ref,
+            event_id=row.event_id,
+            produced_at=row.occurred_at,
+            provenance=DeliverableProvenance.model_validate_json(
+                row.attached_provenance
+            ),
+            deliverables=deliverables,
+        )
+        return ResolutionOutcome(
+            record=row,
+            applied=False,
+            deliverables=healed,
+            detail=(
+                f"quarantined completion {event_id!r} is already resolved — "
+                "re-applied the declaration stored on the row; nothing new "
+                "was attached"
+            ),
+        )
+    return ResolutionOutcome(
+        record=row,
+        applied=False,
+        detail=(
+            f"quarantined completion {event_id!r} is already "
+            f"{row.status.value} — nothing written"
+        ),
+    )
+
+
+def dismiss_quarantined(
+    tenant: str,
+    event_id: str,
+    *,
+    quarantine: QuarantineStore,
+    detail: str,
+) -> QuarantineTransition:
+    """Spec §4's dismiss verb: an operator's judgment that this completion
+    produced no deliverable to record.
+
+    Deliberately a THIN pass-through to the store — there is nothing to compose,
+    which is exactly the difference from `resolve_quarantined` and the reason the
+    two are separate verbs rather than one `close(status)`. It lives here anyway
+    so the operator verbs are found in one place, and so a caller reaching for
+    "how do I close this row?" cannot find one of them and miss that the others
+    write rows."""
+    return quarantine.dismiss(tenant, event_id, detail=detail)
+
+
+@dataclass(frozen=True)
+class RequeueOutcome:
+    """The result of re-running the watch's classification over a quarantined
+    completion's stored event (spec §4's requeue verb).
+
+    `applied` is True exactly when the row was OPEN and this call's
+    re-classification LANDED — whether that was a close (the declaration
+    parsed; `deliverables` holds the writes and `record` the resolved row) or
+    a refresh (still unreadable; `record` stays open with the new reason).
+    False means the row does not exist (`record` is None), was already
+    closed, or a racing closer settled it mid-verb — either way this call
+    decided nothing."""
+
+    record: QuarantineRecord | None
+    applied: bool
+    deliverables: tuple[DeliverableWrite, ...] = ()
+    detail: str | None = None
+
+
+def requeue_quarantined(
+    tenant: str,
+    event_id: str,
+    *,
+    deliverables: DeliverableStore,
+    quarantine: QuarantineStore,
+) -> RequeueOutcome:
+    """Spec §4's requeue verb, spelled for completions: re-run the full watch
+    classification over the OPEN row's stored completion event.
+
+    For the case where the COMPLETION was always right and the READER was not —
+    a provenance parser bug fixed, a schema version this deploy now speaks. The
+    row keeps the event whole (`models.CompletionQuarantineEntry`), so nothing
+    needs re-delivering: the stored event goes back through the same
+    `parse_provenance` the watch runs, and
+
+    - a declaration that now PARSES is recorded through the same guarded
+      upserts the watch uses (newest-completion-wins, so a newer completion's
+      facts are not rolled back) and the row closes as resolved, detail
+      "requeued" — the same terminal state an operator attachment reaches,
+      because the ledger's contents must not depend on which verb recorded
+      them;
+    - a declaration still missing or malformed leaves the row OPEN with its
+      reason, detail and `updated_at` refreshed (`refresh_open`), so the queue
+      says what is wrong NOW rather than what was wrong at filing.
+
+    Guarded like the closing verbs: only open rows. A closed row is a settled
+    observation and refuses (`applied=False`); a row that does not exist
+    reports None. The recording is deliverables-first (unlike
+    `resolve_quarantined`, which must persist an OPERATOR's declaration before
+    closing): the declaration here IS the stored event, already durable on the
+    open row, so a crash between the record and the close re-runs this verb
+    and converges."""
+    row = quarantine.get(tenant, event_id)
+    if row is None:
+        return RequeueOutcome(
+            record=None,
+            applied=False,
+            detail=(
+                f"no quarantined completion {event_id!r} for tenant {tenant!r} — "
+                "nothing to requeue"
+            ),
+        )
+    if not row.is_open:
+        return RequeueOutcome(
+            record=row,
+            applied=False,
+            detail=(
+                f"quarantined completion {event_id!r} is already "
+                f"{row.status.value} — a closed row is settled, not requeueable"
+            ),
+        )
+    # The stored event is the envelope the watch itself was handed, kept whole
+    # (`watch_completion` files `model_dump_json`), so it re-validates.
+    envelope = EventEnvelope.model_validate_json(row.raw_event)
+    parsed = parse_provenance(envelope)
+    if isinstance(parsed, MissingProvenance):
+        reason = (
+            QuarantineReason.provenance_missing
+            if parsed.is_absent
+            else QuarantineReason.provenance_malformed
+        )
+        refreshed = quarantine.refresh_open(
+            tenant,
+            event_id,
+            reason=reason,
+            detail=(
+                f"{parsed.detail} — requeue re-ran the classification and the "
+                "declaration is still unreadable"
+            ),
+        )
+        return RequeueOutcome(
+            record=refreshed.record,
+            applied=refreshed.applied,
+            detail=refreshed.record.detail if refreshed.record else None,
+        )
+    written = _record_deliverables(
+        tenant=tenant,
+        item_ref=row.item_ref,
+        event_id=row.event_id,
+        produced_at=row.occurred_at,
+        provenance=parsed,
+        deliverables=deliverables,
+    )
+    detail = "requeued: the stored declaration now parses — " + ", ".join(
+        f"{declared.channel}/{declared.deliverable_class}"
+        for declared in parsed.deliverables
+    )
+    transition = quarantine.resolve(tenant, event_id, detail=detail)
+    return RequeueOutcome(
+        record=transition.record,
+        # The guarded close's answer, not the earlier read's: a closer racing
+        # this verb settles in the store, and the loser must not report a
+        # decision it did not make (the writes above converge either way).
+        applied=transition.applied,
+        deliverables=written,
+        detail=detail,
+    )
+
+
+class ProvenanceWatchHandler(MintingEvaluationHandler):
+    """`MintingEvaluationHandler` plus the provenance watch — per event, BEFORE
+    the ack. Spec §8 as an `intake.EventHandler`.
+
+    `__call__` watches the event first and then evaluates and mints exactly as
+    the parent does (a stall still raises `EvaluationStalledError`, an
+    unavailable PM still raises `MintingUnavailableError`). Watching first is
+    deliberate: the mint half can stop the pass, and a completion that already
+    happened should not have its provenance recorded late because an unrelated
+    mint could not reach PM (module docstring). Only when both halves have
+    finished does the handler return — and returning is what lets `run_intake`
+    ack — so an acked event is one whose deliverables (or quarantine row) are
+    durable.
+
+    Takes `WatchLedger`, not the parent's `MintingLedger`: the same store must
+    also answer the `created_item_ref` join, because the row the mint wrote is
+    the row the watch reads."""
+
+    def __init__(
+        self,
+        tenant: str,
+        *,
+        provider: PolicyProvider,
+        sink: WorkItemSink,
+        ledger: WatchLedger | None = None,
+        deliverables: DeliverableStore | None = None,
+        quarantine: QuarantineStore | None = None,
+        cache: PolicyCacheStore | None = None,
+        resolution: PolicyResolution | None = None,
+    ) -> None:
+        watch_ledger: WatchLedger = ledger if ledger is not None else DeliveryLedger()
+        super().__init__(
+            tenant,
+            provider=provider,
+            sink=sink,
+            ledger=watch_ledger,
+            cache=cache,
+            resolution=resolution,
+        )
+        self._watch_ledger = watch_ledger
+        self._deliverables = (
+            deliverables if deliverables is not None else DeliverableProvenanceLedger()
+        )
+        self._quarantine = (
+            quarantine if quarantine is not None else CompletionQuarantine()
+        )
+        self.watch_outcomes: list[WatchOutcome] = []
+
+    def __call__(self, envelope: EventEnvelope) -> None:
+        self.watch_outcomes.append(
+            watch_completion(
+                envelope,
+                tenant=self.tenant,
+                ledger=self._watch_ledger,
+                deliverables=self._deliverables,
+                quarantine=self._quarantine,
+            )
+        )
+        super().__call__(envelope)
+
+    @property
+    def watch_report(self) -> WatchPassReport:
+        """Everything this pass observed, in event order. Includes the event a
+        pass stopped on — that event re-delivers un-acked, and its rows converge
+        next pass."""
+        return WatchPassReport(outcomes=tuple(self.watch_outcomes))
+
+
+@dataclass(frozen=True)
+class IntakeWatchResult:
+    """One full drive: an intake pass that watched, evaluated and minted each
+    event before its ack.
+
+    `drive` is `run_intake_and_mint`'s own result, kept WHOLE rather than
+    flattened — the mint half's story (how far the stream got, whether the
+    policies resolved, whether PM was reachable) is unchanged by the watch, and
+    re-exporting its fields here would be a second copy to keep in step. The
+    delegating properties exist so a driver that only wants "did the pass run?"
+    does not have to know which half owns the answer."""
+
+    drive: IntakeMintResult
+    watch: WatchPassReport
+
+    @property
+    def intake(self) -> IntakeResult:
+        return self.drive.intake
+
+    @property
+    def stall(self) -> EvaluationStalled | None:
+        return self.drive.stall
+
+    @property
+    def mint(self) -> MintPassReport:
+        return self.drive.mint
+
+    @property
+    def unavailable(self) -> MintOutcome | None:
+        return self.drive.unavailable
+
+    @property
+    def ok(self) -> bool:
+        """The whole drive completed and nothing needs a human — the mint half's
+        `ok` plus an empty quarantine.
+
+        A quarantined completion is not a FAILURE (spec §8 is explicit that the
+        PM verb keeps no gate and nothing went wrong when someone completed work
+        without declaring what it produced), but it is something a person has to
+        resolve, and this flag's meaning in this codebase is "nothing needs a
+        human" (`minting.IntakeMintResult.ok`). A driver that wants "did the pass
+        run?" reads `intake.ok`."""
+        return self.drive.ok and not self.watch.quarantined
+
+
+def run_intake_and_watch(
+    source: EventSource,
+    *,
+    tenant: str,
+    provider: PolicyProvider,
+    sink: WorkItemSink,
+    cursor_store: CursorStore,
+    ledger: WatchLedger | None = None,
+    deliverables: DeliverableStore | None = None,
+    quarantine: QuarantineStore | None = None,
+    cache: PolicyCacheStore | None = None,
+    on_malformed: MalformedHandler | None = None,
+    limit: int | None = None,
+) -> IntakeWatchResult:
+    """Drive one intake pass that watches, evaluates and mints each event BEFORE
+    its ack — `minting.run_intake_and_mint` with the §8 watch composed in.
+
+    Deliberately a second entry point rather than a flag on the first: a driver
+    that only mints (the §11 dry-run's shape, and any future pass that must not
+    write provenance) keeps a callable that provably cannot touch these tables,
+    and the composition stays readable as "the same drive, plus one observer".
+
+    ONE ledger serves all three halves — the engine writes the rows, the mint
+    transitions them, the watch joins against them — so an in-memory ledger plus
+    the in-memory stores drives a whole fixtures run with no database. Like every
+    other library callable here it is NOT wired into the app lifespan
+    (`MARKETING_ENABLED`, spec §2, gates the live loops)."""
+    handler = ProvenanceWatchHandler(
+        tenant,
+        provider=provider,
+        sink=sink,
+        ledger=ledger,
+        deliverables=deliverables,
+        quarantine=quarantine,
+        cache=cache,
+    )
+    # The pass runs through `minting.drive_intake`, the one place "handler in,
+    # IntakeMintResult out" is spelled, so this composition cannot drift from
+    # `run_intake_and_mint`'s in what it reports or when it stops.
+    return IntakeWatchResult(
+        drive=drive_intake(
+            handler,
+            source,
+            cursor_store=cursor_store,
+            on_malformed=on_malformed,
+            limit=limit,
+        ),
+        watch=handler.watch_report,
+    )

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "event_id": "pm-evt-0000502",
+  "event_type": "item_completed",
+  "tenant": "turtlesedge",
+  "occurred_at": "2026-07-28T11:02:30+00:00",
+  "subject": {
+    "kind": "work_item",
+    "id": "mkt-item-0002"
+  },
+  "payload": {
+    "scope": "turtlesedge/marketing",
+    "initiative": "announcements",
+    "work_kind": "marketing",
+    "details": {
+      "title": "Prepare the v1.4 announcement"
+    }
+  }
+}

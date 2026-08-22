@@ -655,6 +655,39 @@ class IntakeMintResult:
         return self.intake.ok and self.stall is None and not self.mint.needs_operator
 
 
+def drive_intake(
+    handler: MintingEvaluationHandler,
+    source: EventSource,
+    *,
+    cursor_store: CursorStore,
+    on_malformed: MalformedHandler | None = None,
+    limit: int | None = None,
+) -> IntakeMintResult:
+    """Run one intake pass through `handler` and assemble its report.
+
+    The one place "handler in, `IntakeMintResult` out" is spelled. Extracted
+    from `run_intake_and_mint` so a composition that EXTENDS the handler —
+    `watch.ProvenanceWatchHandler`, spec §8's provenance watch — reports the
+    same fields, gathered the same way, instead of hand-copying four lines that
+    would then have to be kept in step. The handler is passed in rather than
+    built here because one handler per pass is load-bearing: its policy
+    resolution is memoized per INSTANCE (`engine.EvaluationHandler`), which is
+    what makes "one policy version decided this pass's rows" true."""
+    intake = run_intake(
+        source,
+        handler,
+        cursor_store=cursor_store,
+        on_malformed=on_malformed,
+        limit=limit,
+    )
+    return IntakeMintResult(
+        intake=intake,
+        stall=handler.stall,
+        mint=handler.mint_report,
+        unavailable=handler.unavailable,
+    )
+
+
 def run_intake_and_mint(
     source: EventSource,
     *,
@@ -688,16 +721,10 @@ def run_intake_and_mint(
     handler = MintingEvaluationHandler(
         tenant, provider=provider, sink=sink, ledger=ledger, cache=cache
     )
-    intake = run_intake(
-        source,
+    return drive_intake(
         handler,
+        source,
         cursor_store=cursor_store,
         on_malformed=on_malformed,
         limit=limit,
-    )
-    return IntakeMintResult(
-        intake=intake,
-        stall=handler.stall,
-        mint=handler.mint_report,
-        unavailable=handler.unavailable,
     )
